@@ -16,7 +16,7 @@ f = ss.SteadyState(1e5, 1,
   })
 x = np.linspace(-4150, -150, 1000) 
 U = f(x)
-for i in range (7): 
+for i in range (8): 
   plt.subplot(3,3,i+1)
   plt.plot(x, U[...,i])
 plt.show()
@@ -26,6 +26,7 @@ plt.show()
 import numpy as np
 import scipy
 import scipy.integrate
+from scipy.special import erf
 import matplotlib.pyplot as plt
 import compressible_conduit_steady.material_properties as matprops
 
@@ -34,10 +35,7 @@ import compressible_conduit_steady.material_properties as matprops
 
 # WARNING: setting u may have multiple possible p_chambers. This corresponds to
 # a different position of the exsolution front
-# TODO: cache solution for sampling
-# TODO: implement property pass-through (material parameters)
 # also, use local space variables everywhere instead of param=.
-# TODO: mode for solving for pchamber instead of j0
 # print->log
 # plot interactive checks
 # matprops interactive checks, thermopotential surface plotting
@@ -77,12 +75,16 @@ class SteadyState():
     #   1e-5 is 10 ppm
     self.yWvInletMin    = override_properties.pop("yWvInletMin", 1e-5)
     # Crystal content (mass fraction; must be less than yl = 1.0 - ywt)
-    self.yC             = override_properties.pop("yC", 0.01)
-    self.yCMin          = override_properties.pop("yCMin", 1e-5)
+    self.yC             = override_properties.pop("yC", 1e-7)
+    self.yCMin          = override_properties.pop("yCMin", 1e-7)
+    # Inlet fragmented mass fraction
+    self.yFInlet        = override_properties.pop("yFInlet", 0.0)
     # Critical volume fraction
     self.crit_volfrac   = override_properties.pop("crit_volfrac", 0.7)
     # Exsolution timescale
     self.tau_d          = override_properties.pop("tau_d", 1.0)
+    # Fragmentation timescale
+    self.tau_f          = override_properties.pop("tau_f", 1.0)
     # Viscosity (Pa s)
     self.mu             = override_properties.pop("mu", 1e5)
     # Conduit dimensions (m)
@@ -104,11 +106,17 @@ class SteadyState():
     # pickled by the default pickle module)
     self._DEBUG = False
 
+    # Compute liquid melt fraction
+    self.yL = 1.0 - (self.yC + self.yA + self.yWt)
+
     # Input validation
     if self.yC + self.yA + self.yWt > 1:
       raise ValueError(f"Component mass fractions are [" +
-        f"{self.yC, self.yA, self.yWt, 1.0-self.yC-self.yA-self.yWt}] for " +
+        f"{self.yC, self.yA, self.yWt, self.yL}] for " +
         f"[crystal, air, water, melt].")
+    if self.yFInlet > self.yL:
+      raise ValueError(f"Inlet fragmented mass fraction exceeds the liquid" +
+      f"melt mass fraction: inlet fragmented {self.yFInlet}, liquid melt {self.yL}.")
     if len(override_properties.items()) > 0:
       raise ValueError(
         f"Unused override properties:{list(override_properties.keys())}")
@@ -159,24 +167,32 @@ class SteadyState():
     return self.mixture.y_wv_eq(p, self.yWt, self.yC)
 
 
-  def A(self, p, h, y, j0):
-    ''' Returns coefficient matrix to ODE (A in A dq/dx = f(q)). '''
-    A = np.zeros((3,3))
+  def A(self, p, h, y, yf, j0):
+    ''' Returns coefficient matrix to ODE (A in A dq/dx = f(q)).
+    Coefficient matrix has block structure:
+    [_ _ _ 0] [p ]
+    [_ _ 0 0] [h ]
+    [0 0 _ 0] [y ]
+    [0 0 0 _] [yf]
+     '''
+    A = np.zeros((4,4))
     # Evaluate mixture state
     T = self.T_ph(p, h, y)
     v = self.v_mix(p, T, y)
     # Construct coefficient matrix
     A[0,:] = [j0**2 * self.dv_dp(p,T,y) + 1.0,
               j0**2 * self.dv_dh(p,T,y),
-              j0**2 * self.dv_dy(p,T,y)]
-    A[1,:] = [v, -1, 0]
-    A[2,:] = [0, 0, j0*v]
+              j0**2 * self.dv_dy(p,T,y),
+              0]
+    A[1,:] = [v, -1, 0, 0]
+    A[2,:] = [0, 0, j0*v, 0]
+    A[3,:] = [0, 0, 0, j0*v]
     return A
 
   ''' Define eigenvalues of A '''
-  def eigA(self, p, h, y, j0):
+  def eigA(self, p, h, y, yF, j0):
     '''The eigenvalues are 
-      u,
+      u, u,
     which transports the chemical state (dy/dx), and the pair
       0.5 * j0^2 * (dv/dp)_{h,y} + 0.5 * sqrt((j0^2 dv/dp)^2 + 4(1 + j0^2 dv/dp + v j0^2 (dv/dh)) ),
       0.5 * j0^2 * (dv/dp)_{h,y} - 0.5 * sqrt((j0^2 dv/dp)^2 + 4(1 + j0^2 dv/dp + v j0^2 (dv/dh)) ).
@@ -191,12 +207,49 @@ class SteadyState():
     _q2 = np.sqrt(_q1**2 + 4 * (1 + _q1 + v * j0**2 * self.dv_dh(p, T, y)))
     l1 = 0.5*(_q1 - _q2)
     l2 = 0.5*(_q1 + _q2)
-    return np.array([u, l1, l2])
+    return np.array([l1, l2, u, u])
   
-  def F_fric(self, p, T, y, yC, yWt, u) -> float:
-    ''' Exposed friction (force per unit volume)'''
-    is_frag = float(self.vf_g(p, T, y) > self.crit_volfrac)
-    return -8.0*self.mu/self.conduit_radius**2 * u * (1.0 - is_frag)
+  def F_fric(self, p, T, y, yF, rho, u) -> float:
+    ''' Friction (force per unit volume)'''
+    # is_frag = float(self.vf_g(p, T, y) > self.crit_volfrac)
+
+    # Poll friction model
+    # mu = self.mu
+    mu = self.F_fric_viscosity_model(T, y, yF)
+
+    frag_factor = np.clip(1.0 - yF/self.yL, 0.0, 1.0)
+    return -8.0*mu/self.conduit_radius**2 * u * frag_factor
+
+  def F_fric_viscosity_model(self, T, y, yF) -> float:
+    ''' Calculates the viscosity as a function of dissolved
+    water and crystal content (assumes crystal phase is incompressible)/
+    Does not take into account fragmented vs. not fragmented (avoiding
+    double-dipping the effect of fragmentation).
+    '''
+    # Calculate pure melt viscosity (Hess & Dingwell 1996)
+    yWd = self.yWt - y
+    yL = self.yL
+    yM = 1.0 - y - self.yA
+    mfWd = yWd / yL # mass concentration of dissolved water
+    log_mfWd = np.log(mfWd*100)
+    log10_vis = -3.545 + 0.833 * log_mfWd
+    log10_vis += (9601 - 2368 * log_mfWd) / (T - 195.7 - 32.25 * log_mfWd)
+    meltVisc = 10**log10_vis
+    # Calculate relative viscosity due to crystals (Costa 2005).
+    alpha = 0.999916
+    phi_cr = 0.673
+    gamma = 3.98937
+    delta = 16.9386
+    B = 2.5
+    # Compute volume fraction of crystal at equal phasic densities
+    # Using crystal volume per (melt + crystal + dissolved water) volume
+    phi_ratio = (self.yC / yM) / phi_cr
+    erf_term = erf(
+      np.sqrt(np.pi) / (2 * alpha) * phi_ratio * (1 + phi_ratio**gamma))
+    crysVisc = (1 + phi_ratio**delta) * ((1 - alpha * erf_term)**(-B * phi_cr))
+    
+    viscosity = meltVisc * crysVisc
+    return viscosity
 
   def solve_ssIVP(self, p_chamber, j0) -> tuple:
     ''' Solves initial value problem for (p,h,y)(x), given fully specified
@@ -208,11 +261,12 @@ class SteadyState():
         and system eigvals at vent) '''
 
     # Pull parameter values
-    yA, yWt, yC, crit_volfrac, mu, tau_d, conduit_radius, T_chamber = \
+    yA, yWt, yC, crit_volfrac, mu, tau_d, tau_f, conduit_radius, T_chamber = \
       self.yA, self.yWt, self.yC, self.crit_volfrac, self.mu, self.tau_d, \
-      self.conduit_radius, self.T_chamber
+      self.tau_f, self.conduit_radius, self.T_chamber
     x0, N_x = self.x0, self.N_x
-    # Compute inlet conditions
+    yFInlet = self.yFInlet
+    # Compute auxiliary inlet conditions
     yWvInlet = np.clip(self.y_wv_eq(p_chamber), self.yWvInletMin, None)
     h_chamber = self.mixture.h_mix(
       p_chamber, T_chamber, yA, yWvInlet, 1.0-yA-yWvInlet)
@@ -221,32 +275,37 @@ class SteadyState():
     # Define gravity momentum source
     F_grav = lambda rho: rho * (-9.8)
     # Define ODE momentum source term sum in terms of density rho
-    F_rho = lambda p, T, y, rho: F_grav (rho) + self.F_fric(p, T, y, yC, yWt, j0/rho)
+    F_rho = lambda p, T, y, yF, rho: F_grav(rho) \
+      + self.F_fric(p, T, y, yF, rho, j0/rho)
 
     ''' Define water vapour mass fraction source. '''
     # Define source in mass per total volume
-    S_source = lambda p, y, rho: rho / tau_d * (1.0 - yC - yWt) * float(y > 0) * (
+    S_source = lambda p, y, rho: rho / tau_d * (1.0 - yC - yWt - yA) * float(y > 0) * (
       (yWt - y)/(1.0 - yC - yWt) - self.x_sat(p))
     # Define equivalent source for mass fraction exsolved (y, or yWv)
-    Y_unlimited = lambda p, y: 1.0 / tau_d * float(yWt > y) * (
-      (yWt - y) - self.x_sat(p) * (1.0 - yC - yWt))
+    target_yWd = lambda p: np.clip(
+      self.x_sat(p) * (1.0 - yC - yWt - yA), 0, yWt - self.yWvInletMin)
+    Y = lambda p, y: 1.0 / tau_d * ((yWt - y) - target_yWd(p))
     # One-way gating
-    Y = lambda p, y: float(y > 0) * Y_unlimited(p, y) \
-      + float(y <= 0) * np.clip(Y_unlimited(p,y), 0, None)
+    # Y = lambda p, y: float(y > 0) * Y_unlimited(p, y) \
+    #   + float(y <= 0) * np.clip(Y_unlimited(p,y), 0, None)
     # Ramp gating
     # Y = lambda p, y: np.clip(y, None, self.yWvInletMin) / self.yWvInletMin * Y_unlimited(p, y)
     
     ''' Set source term vector. '''
     def F(q):
-      # Unpack q of size (3,1)
-      p, h, y = q
-      F = np.zeros((3,1))
+      # Unpack q of size (4,1)
+      p, h, y, yF = q
+      F = np.zeros((4,1))
       # Compute mixture temperature, density
       T = self.T_ph(p, h, y)
       rho = 1.0/self.v_mix(p, T, y)
+      # Compute (constant) liquid melt fraction
+      yL = 1.0 - self.yWt - self.yC - self.yA
       # Compute source vector
-      F[0] = F_rho(p, T, y, rho) 
+      F[0] = F_rho(p, T, y, yF, rho) 
       F[2] = Y(p, y)
+      F[3] = (yL - yF) / self.tau_f * float(self.vf_g(p, T, y) >= self.crit_volfrac)
       return F
     if self._DEBUG:  
       # Cache source term (cannot be pickled with default pickle module)
@@ -258,7 +317,7 @@ class SteadyState():
       Used in ODE solver for dq/dx == RHS(x, q).
       Use AinvRHS instead for speed; this function
       shows more clearly the equation being solved,
-      but relies on numerical inversion of a 3x3
+      but relies on numerical inversion of a 4x4
       matrix.
       '''
       # Solve for RHS ode
@@ -273,7 +332,7 @@ class SteadyState():
       Use this instead of RHS for speed.
       '''
       # Unpack
-      p, h, y = q
+      p, h, y, yF = q
       # Compute dependents
       T     = self.T_ph(p, h, y)
       # dv_dp = y * (R / p * dT_dp(p, h, y) - R * T / p**2) + (1 - y) * dvm_dp(p)
@@ -286,11 +345,15 @@ class SteadyState():
         + v * j0**2 * self.dv_dh(p, T, y))
       # Compute z == -A^{-1} * b / u
       z = -j0**2 * self.dv_dy(p, T, y) / u * a1
-      return Y(p, y) * np.array([*z, 1/u]) \
-        + F_rho(p, T, y, 1.0/v) * np.array([*a1, 0])
+      yL = 1.0 - yWt - yC - yA
+      return Y(p, y) * np.array([*z, 1/u, 0]) \
+        + F_rho(p, T, y, yF, 1.0/v) * np.array([*a1, 0, 0]) \
+        + np.array([0, 0, 0, (yL - yF) / self.tau_f
+          * float(self.vf_g(p, T, y) >= self.crit_volfrac)])
     
     def RHS_reduced(x, q):
-      ''' Reduced-size system for j0 == 0 case. (2x1 instead of 3x1). '''
+      ''' Reduced-size system for j0 == 0 case. (2x1 instead of 4x1).
+      Length scale of exsolution and fragmentation -> 0. '''
       p, h = q
       F = np.zeros((2,1))
       # Equilibrium water vapour
@@ -298,10 +361,13 @@ class SteadyState():
       # Compute mixture temperature
       T = self.T_ph(p, h, y)
       v = self.v_mix(p, T, y)
+      # Compute fragmented mass fraction
+      yL = 1.0 - yWt - yC - yA
+      yF = yL if self.vf_g(p, T, y) >= self.crit_volfrac else 0
       # Compute source vector with idempotent A^{-1} = A premultiplied
       F[0] = 1
       F[1] = v
-      F *= F_rho(p, T, y, 1.0/self.v_mix(p, T, y)) 
+      F *= F_rho(p, T, y, yF, 1.0/self.v_mix(p, T, y)) 
       return F.flatten()
     
     ''' Define postprocessing eigenvalue checker '''  
@@ -314,7 +380,7 @@ class SteadyState():
       def __call__(self, t, q):
         # Compute equivalent condition to conjugate pair eigenvalue == 0
         # Note that this does not check the condition u == 0 (or j0 == 0).
-        p, h, y = q
+        p, h, y, yF = q
         T = T_ph(p, h, y)
         # dv_dp = y * (R / p * dT_dp(p, h, y) - R * T / p**2) + (1 - y) * dvm_dp(p)
         # dv_dh = y * R / p * dT_dh(p, h, y)
@@ -329,7 +395,7 @@ class SteadyState():
         self.terminal = True
         self.direction = -1.0
       def __call__(self, t, q):
-        p, h, y = q
+        p, h, y, yF = q
         return p
 
     class ZeroEnthalpy():
@@ -337,7 +403,7 @@ class SteadyState():
         self.terminal = True
         self.direction = -1.0
       def __call__(self, t, q):
-        p, h, y = q
+        p, h, y, yF = q
         return h
     
     class PositivePressureGradient():
@@ -349,7 +415,7 @@ class SteadyState():
         return float(self.RHS(t, q)[0] <= 0)
 
     # Set chamber (inlet) condition (p, h, y) with y = y_eq at pressure
-    q0 = np.array([p_chamber, h_chamber, yWvInlet])
+    q0 = np.array([p_chamber, h_chamber, yWvInlet, yFInlet])
 
     if self._DEBUG:
       # Cache ODE details
@@ -363,10 +429,11 @@ class SteadyState():
       soln_state = soln.y
     else: # Exsolution length scale u * tau_d -> 0
       # Exact zero flux: use reduced (equilibrium chemistry) system
-      soln = scipy.integrate.solve_ivp(RHS_reduced, (self.x_mesh[0],self.x_mesh[-1]), q0[:-1], t_eval=self.x_mesh, method="Radau",
+      soln = scipy.integrate.solve_ivp(RHS_reduced, (self.x_mesh[0],self.x_mesh[-1]), q0[0:2], t_eval=self.x_mesh, method="Radau",
         events=[EventChoked(), ZeroPressure(), ZeroEnthalpy(), PositivePressureGradient(RHS_reduced)])
-      # Augment output solution with y at equilibrium
-      soln_state = np.vstack((soln.y, self.y_wv_eq(soln.y[0,:])))
+      # Augment output solution with y at equilibrium and yF based on frag criterion
+      # TODO: replace lazy yF fill with 0-1 values
+      soln_state = np.vstack((soln.y, self.y_wv_eq(soln.y[0,:]), np.nan*np.zeros(soln.y[0,:])))
 
     # Compute eigenvalues at the final t
     eigvals_t_final = self.eigA(*soln_state[:,-1], j0)
@@ -395,9 +462,11 @@ class SteadyState():
       # Return solution state (p, h, y)
       return self.solve_ssIVP(self.p_chamber, self.j0)[1]
     else:
-      p, h, y = self.solve_ssIVP(self.p_chamber, self.j0)[1]
+      p, h, y, yF = self.solve_ssIVP(self.p_chamber, self.j0)[1]
 
       # Correction for mesh perturbation (correct for up to one node)
+      # If the flow is close to vent-choked, numerical perturbation to the IVP
+      # solver can result in choking below the vent.
       if len(y.ravel()) == len(self.x_mesh) - 1:
         # Extrapolate
         p, h, y = np.hstack((p, 2*p[-1] + p[-2])), \
@@ -418,8 +487,8 @@ class SteadyState():
       U[...,3] = self.j0
       U[...,4] = 0.5 * self.j0**2 * v + h/v - p
       U[...,5] = self.yWt / v
-      U[...,6] = yC / v
-      U[...,7] = 0.0 # Fragmented magma condition
+      U[...,6] = self.yC / v
+      U[...,7] = yF / v
       return U
 
   def solve_steady_state_problem(self, p_vent:float, inlet_input_val:float,
@@ -437,9 +506,9 @@ class SteadyState():
     pressure, and then checking if flow is choked at the computed j0.
     '''
     # Pull parameter values
-    yA, yWt, yC, crit_volfrac, mu, tau_d, conduit_radius, T_chamber = \
+    yA, yWt, yC, crit_volfrac, mu, tau_d, tau_f, conduit_radius, T_chamber = \
       self.yA, self.yWt, self.yC, self.crit_volfrac, self.mu, self.tau_d, \
-      self.conduit_radius, self.T_chamber
+      self.tau_f, self.conduit_radius, self.T_chamber
     
     p_global_min = 0.1e5
     if p_vent < p_global_min:
@@ -471,8 +540,11 @@ class SteadyState():
       vMax = yMax * vwMax + (1 - yMax) * self.mixture.magma.v_pT(p_vent, None)
       # Estimate minimum chamber pressure
       p_est = p_vent + self.conduit_length * 9.8 /  vMax
-      # Set arbitrary factor of minimum pressure to filter out fragmented-inlet root
-      p_min = np.max((p_min, 2.0*p_est))
+      # Compute saturation pressure
+      p_sat = (self.yWt / self.yL / self.solubility_k) ** (1/self.solubility_n)
+      p_min = np.max((p_min, p_sat))
+      # print(p_est, p_min, p_sat)
+      z_min = p_min
 
     elif input_type.lower() in ("j", "j0",):
       # Set p_chamber range for finding max
@@ -481,7 +553,7 @@ class SteadyState():
       j0 = inlet_input_val
       # Define solve kernel that returns (x, (p, h, y), (soln, eigvals))
       solve_kernel = lambda p_chamber: self.solve_ssIVP(
-        p_chamber, u0/v_pc(p_chamber))
+        p_chamber, j0)
       p_vent_max = p_max
       _input_type = "u"
       mass_flux_cofactor = lambda p: 1.0
@@ -505,10 +577,10 @@ class SteadyState():
       ''' Returns the smaller conjugate-pair eigval at top,
       or negative value if the matrix is singular at depth.
       Assumes that the correct eigval is indexed by 1 in list
-      [u, u-k, u+k].''' 
+      [u-k, u+k, u, u].''' 
       _t, _z, outs = solve_kernel(z)
       return -1e-1 if len(outs[0].t_events[0]) != 0 or not outs[0].success else \
-        np.abs(outs[1][1])
+        np.abs(outs[1][0])
 
     ''' 
     For input p_chamber, the bounds on p_vent are given by the hydrostatic and
@@ -527,29 +599,105 @@ class SteadyState():
       if p_vent < calc_vent_p(z_choke):
         # Choked case
         print("Choked at vent.")
-        x, (p_soln, h_soln, y_soln), (soln, _) = solve_kernel(z_choke)
+        x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z_choke)
       elif p_vent > p_vent_max:
         # Inconsistent pressure (exceeds hydrostatic pressure consistent with chamber pressure)
         print("Vent pressure is too high (reverse flow required to reverse pressure gradient).")
-        x, (p_soln, h_soln, y_soln), soln = None, (None, None, None), None
+        x, (p_soln, h_soln, y_soln, yF_soln), soln = None, (None, None, None), None
       else:
         print("Subsonic flow at vent. Shooting method for correct value of z.")
         z = scipy.optimize.brenth(lambda z: calc_vent_p(z) - p_vent, z_min, z_max)
         print("Solution j0 found. Computing solution.")
         # Compute solution at j0
-        x, (p_soln, h_soln, y_soln), (soln, _) = solve_kernel(z)
+        x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
     elif _input_type == "u":
-      # z_max = z_choke
-      print("Pressure matching for vent pressure at given velocity.")
-      # Define wrapped objective taking into subpressurized flow
-      def objective(z):
-        soln = solve_kernel(z)
-        # Retrieve 
-        z_top = soln[0][-1]
-        p_top = soln[1][0,-1]
-        return p_top - p_vent if z_top >= self.x_mesh[-1] else -p_vent
-      z = scipy.optimize.brenth(objective, z_min, z_max)
-      x, (p_soln, h_soln, y_soln), (soln, _) = solve_kernel(z)
+      # Number of times to double pressure while searching for choking pressure
+      N_doubling = 25
+
+      if input_type.lower() in ("j", "j0",):        
+        j0_u = lambda p: j0
+      else:
+        u = inlet_input_val
+        j0_u = lambda p: u / self.v_mix(p, self.T_chamber,
+          np.clip(self.y_wv_eq(p), self.yWvInletMin, None))
+
+      print("Computing minimum possible pressure.")
+      ''' Compute loose lower bound on pressure due to gravity. '''
+      # Lower bound pressure
+      yMax = self.yWt - self.x_sat(p_vent) * (
+        1.0 - self.yC - self.yWt - self.yA)
+      # Compute maximum water vapour volume
+      vwMax = 1.0 / p_vent * self.mixture.waterEx.R * self.T_chamber
+      # Compute maximum mixture volume
+      vMax = yMax * vwMax + (1 - yMax) * self.mixture.magma.v_pT(p_vent, None)
+      p_minbound = p_vent + self.conduit_length * 9.8 /  vMax
+
+      ''' Find lowest-pressure continuous solution '''
+      p0 = p_minbound
+      for k in range(N_doubling):
+        # Compute IVP solution
+        
+        p_chamber = p0*2**k
+        j0 = j0_u(p_chamber)
+        _out = self.solve_ssIVP(p0*2**k, j0)
+        p_top = _out[1][0,-1]
+        x_top = _out[0][-1]
+        # ''' Top pressure and pressure grad check'''
+        # q_top = _out[1][:,-1]
+        # dqdx = np.linalg.solve(self.A(*q_top, j0), self.F(q_top)).flatten()
+        # dpdx = dqdx[0]
+        # # Tolerable distance-to-zero-pressure
+        # p_min = 0.001e6 # 1 mbar
+        # dx_min = 1.0    # 1 m until zero pressure
+        # is_reached_vacuum = p_top < p_min or p_top/np.abs(dpdx) < dx_min
+        # Search criterion
+        if x_top >= self.x_mesh[-1]:
+          break
+      else:
+        raise Exception("Could not bracket lower pressure limit.")
+
+      def bisect_pmin(a,b):
+        ''' Manual bisection for minimum pressure. '''
+        fn_x_top = lambda p: self.solve_ssIVP(p, j0_u(p))[0][-1]
+        # Reject if continuous solution at low bracketing pressure
+        if fn_x_top(a) >= self.x_mesh[-1]:
+          raise ValueError(f"Pressure {a} is a continuous solution.")
+        # Reject if no continuous solution at high bracketing pressure
+        if fn_x_top(b) < self.x_mesh[-1]:
+          raise ValueError(f"Pressure {b} is not a continuous solution.")
+
+        abs_tol = 1e-1
+        m = 0.5*(a+b)
+
+        while b - a > abs_tol:
+          # Search criterion
+          if fn_x_top(m) >= self.x_mesh[-1]: # Continuous solution found
+            b = m
+          else:
+            a = m
+          m = 0.5*(a+b)
+        return b # Continuous solution
+      # Compute minimum possible chamber pressure
+      pc_min = bisect_pmin(p0*2**k/2, p0*2**k)
+      # Compute corresponding minimum vent pressure
+      p_vent_min = self.solve_ssIVP(pc_min, j0_u(pc_min))[1][0,-1]
+      print(f"Minimum vent pressure is {p_vent_min}.")
+      if p_vent <= p_vent_min:
+        print("Choked flow.")
+        z = pc_min
+        x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
+      else:
+        # Unchoked
+        print("Pressure matching for vent pressure at given velocity.")
+        # Define wrapped objective taking into subpressurized flow
+        def objective(z):
+          soln = solve_kernel(z)
+          # Retrieve 
+          z_top = soln[0][-1]
+          p_top = soln[1][0,-1]
+          return p_top - p_vent if z_top >= self.x_mesh[-1] else -p_vent
+        z = scipy.optimize.brenth(objective, pc_min, z_max)
+        x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
 
     if verbose:
       # Package extra details on calculation.
@@ -568,9 +716,9 @@ class SteadyState():
         calc_details["p"] = inlet_input_val
         calc_details["j0"] = z
 
-      return x, (p_soln, h_soln, y_soln), calc_details
+      return x, (p_soln, h_soln, y_soln, yF_soln), calc_details
     else:
-      return x, (p_soln, h_soln, y_soln)
+      return x, (p_soln, h_soln, y_soln, yF_soln)
 
 
 if __name__ == "__main__":

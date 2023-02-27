@@ -542,6 +542,21 @@ class MixtureMeltCrystalWaterAir():
     ''' Derivative of water volume fraction w.r.t. pressure. '''
     return (ywt+yc-1) * self.ddp_x_sat(p) * self.sat_indicator(p, ywt, yc)
 
+  ''' Define mixture methods. '''
+
+  def volfrac(self, p, T, yA, yWv, yM):
+    ''' Phase volume fractions. '''
+    phi = self.vf_g(p, T, yA, yWv, yM)
+    # Ideal gas partition by mole fraction
+    vf = phi * self.ideal_molfrac(yA, yWv, yM)
+    vf[2] = 1 - phi
+    return vf
+
+  def ideal_molfrac(self, yA, yWv, yM):
+    ''' Mole fractions of ideal gases in mixture. '''
+    x = np.array([yA * self.air.R, yWv * self.waterEx.R, 0])
+    return x / x.sum()
+
   def v_mix(self, p, T, yA, yWv, yM):
     ''' Mixture specific volume '''
     return yA * self.air.v_pT(p, T) \
@@ -629,6 +644,22 @@ class MixtureMeltCrystalWaterAir():
   def Gamma_mix(self, yA, yWv, yM):
     ''' Heat capacity ratio for the mixture. '''
     return self.c_p(yA, yWv, yM) / self.c_v(yA, yWv, yM)
+
+  def dv_dp_s(self, p, T, yA, yWv, yM):
+    ''' Isentropic derivative dv/dp '''
+    y = np.array([yA, yWv, yM])
+    # Partials of phasic volume in Gibbs (p,T) coordinates
+    # Note: for Helmholtz variables (v, T), one can obtain vT = - pT/pv
+    # from the cyclic relation, and vp = 1/pv
+    vp = np.array([phase.dv_dp_isoT_pT(p,T) for phase in self.phases])
+    vT = np.array([phase.dv_dT_isop_pT(p,T) for phase in self.phases])
+    return np.dot(y, vp) + \
+      T * np.dot(y, vT) ** 2 / (self.c_v(yA, yWv, yM) - T*np.dot(y, vT*vT/vp))
+
+  def sound_speed(self, p, T, yA, yWv, yM):
+    ''' Mixture sound speed. '''
+    v = self.v_mix(p, T, yA, yWv, yM)
+    return np.sqrt(-v*v / self.dv_dp_s(p, T, yA, yWv, yM))
 
   @staticmethod
   def T_isentropic(p, p0, T0, Gamma):
