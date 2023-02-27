@@ -26,6 +26,7 @@ plt.show()
 import numpy as np
 import scipy
 import scipy.integrate
+from scipy.special import erf
 import matplotlib.pyplot as plt
 import material_properties as matprops
 
@@ -93,15 +94,17 @@ class SteadyState():
     self.solubility_k   = override_properties.pop("solubility_k", 5e-6)
     self.solubility_n   = override_properties.pop("solubility_n", 0.5)
 
+    # Compute liquid melt fraction
+    self.yL = 1.0 - (self.yC + self.yA + self.yWt)
+
     # Input validation
-    yL = 1.0 - (self.yC + self.yA + self.yWt)
     if self.yC + self.yA + self.yWt > 1:
       raise ValueError(f"Component mass fractions are [" +
-        f"{self.yC, self.yA, self.yWt, 1.0-self.yC-self.yA-self.yWt}] for " +
+        f"{self.yC, self.yA, self.yWt, self.yL}] for " +
         f"[crystal, air, water, melt].")
-    if self.yFInlet > yL:
+    if self.yFInlet > self.yL:
       raise ValueError(f"Inlet fragmented mass fraction exceeds the liquid" +
-      f"melt mass fraction: inlet fragmented {self.yFInlet}, liquid melt {yL}.")
+      f"melt mass fraction: inlet fragmented {self.yFInlet}, liquid melt {self.yL}.")
     if len(override_properties.items()) > 0:
       raise ValueError(
         f"Unused override properties:{list(override_properties.keys())}")
@@ -180,11 +183,46 @@ class SteadyState():
     return np.array([l1, l2, u, u])
   
   def F_fric(self, p, T, y, yF, rho, u) -> float:
-    ''' Exposed friction (force per unit volume)'''
-    yL = 1.0 - self.yWt - self.yC - self.yA
+    ''' Friction (force per unit volume)'''
     # is_frag = float(self.vf_g(p, T, y) > self.crit_volfrac)
-    frag_factor = np.clip(1.0 - yF/yL, 0.0, 1.0)
-    return -8.0*self.mu/self.conduit_radius**2 * u * frag_factor
+
+    # Poll friction model
+    # mu = self.mu
+    mu = self.F_fric_viscosity_model(T, y, yF)
+
+    frag_factor = np.clip(1.0 - yF/self.yL, 0.0, 1.0)
+    return -8.0*mu/self.conduit_radius**2 * u * frag_factor
+
+  def F_fric_viscosity_model(self, T, y, yF) -> float:
+    ''' Calculates the viscosity as a function of dissolved
+    water and crystal content (assumes crystal phase is incompressible)/
+    Does not take into account fragmented vs. not fragmented (avoiding
+    double-dipping the effect of fragmentation).
+    '''
+    # Calculate pure melt viscosity (Hess & Dingwell 1996)
+    yWd = self.yWt - y
+    yL = self.yL
+    yM = 1.0 - y - self.yA
+    mfWd = yWd / yL # mass concentration of dissolved water
+    log_mfWd = np.log(mfWd*100)
+    log10_vis = -3.545 + 0.833 * log_mfWd
+    log10_vis += (9601 - 2368 * log_mfWd) / (T - 195.7 - 32.25 * log_mfWd)
+    meltVisc = 10**log10_vis
+    # Calculate relative viscosity due to crystals (Costa 2005).
+    alpha = 0.999916
+    phi_cr = 0.673
+    gamma = 3.98937
+    delta = 16.9386
+    B = 2.5
+    # Compute volume fraction of crystal at equal phasic densities
+    # Using crystal volume per (melt + crystal + dissolved water) volume
+    phi_ratio = (self.yC / yM) / phi_cr
+    erf_term = erf(
+      np.sqrt(np.pi) / (2 * alpha) * phi_ratio * (1 + phi_ratio**gamma))
+    crysVisc = (1 + phi_ratio**delta) * ((1 - alpha * erf_term)**(-B * phi_cr))
+    
+    viscosity = meltVisc * crysVisc
+    return viscosity
 
   def solve_ssIVP(self, p_chamber, j0) -> tuple:
     ''' Solves initial value problem for (p,h,y)(x), given fully specified
@@ -459,8 +497,11 @@ class SteadyState():
       vMax = yMax * vwMax + (1 - yMax) * self.mixture.magma.v_pT(p_vent, None)
       # Estimate minimum chamber pressure
       p_est = p_vent + self.conduit_length * 9.8 /  vMax
-      # Set arbitrary factor of minimum pressure to filter out fragmented-inlet root
-      p_min = np.max((p_min, 2.0*p_est))
+      # Compute saturation pressure
+      p_sat = (self.yWt / self.yL / self.solubility_k) ** (1/self.solubility_n)
+      p_min = np.max((p_min, p_sat))
+      # print(p_est, p_min, p_sat)
+      z_min = p_min
 
     elif input_type.lower() in ("j", "j0",):
       # Set p_chamber range for finding max
