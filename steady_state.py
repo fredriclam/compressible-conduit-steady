@@ -400,7 +400,7 @@ class SteadyState():
       soln_state = soln.y
     else: # Exsolution length scale u * tau_d -> 0
       # Exact zero flux: use reduced (equilibrium chemistry) system
-      soln = scipy.integrate.solve_ivp(RHS_reduced, (self.x_mesh[0],self.x_mesh[-1]), q0[:-1], t_eval=self.x_mesh, method="Radau",
+      soln = scipy.integrate.solve_ivp(RHS_reduced, (self.x_mesh[0],self.x_mesh[-1]), q0[0:2], t_eval=self.x_mesh, method="Radau",
         events=[EventChoked(), ZeroPressure(), ZeroEnthalpy(), PositivePressureGradient(RHS_reduced)])
       # Augment output solution with y at equilibrium and yF based on frag criterion
       # TODO: replace lazy yF fill with 0-1 values
@@ -510,7 +510,7 @@ class SteadyState():
       j0 = inlet_input_val
       # Define solve kernel that returns (x, (p, h, y), (soln, eigvals))
       solve_kernel = lambda p_chamber: self.solve_ssIVP(
-        p_chamber, u0/v_pc(p_chamber))
+        p_chamber, j0)
       p_vent_max = p_max
       _input_type = "u"
       mass_flux_cofactor = lambda p: 1.0
@@ -568,17 +568,93 @@ class SteadyState():
         # Compute solution at j0
         x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
     elif _input_type == "u":
-      # z_max = z_choke
-      print("Pressure matching for vent pressure at given velocity.")
-      # Define wrapped objective taking into subpressurized flow
-      def objective(z):
-        soln = solve_kernel(z)
-        # Retrieve 
-        z_top = soln[0][-1]
-        p_top = soln[1][0,-1]
-        return p_top - p_vent if z_top >= self.x_mesh[-1] else -p_vent
-      z = scipy.optimize.brenth(objective, z_min, z_max)
-      x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
+      # Number of times to double pressure while searching for choking pressure
+      N_doubling = 25
+
+      if input_type.lower() in ("j", "j0",):        
+        j0_u = lambda p: j0
+      else:
+        u = inlet_input_val
+        j0_u = lambda p: u / self.v_mix(p, self.T_chamber,
+          np.clip(self.y_wv_eq(p), self.yWvInletMin, None))
+
+      print("Computing minimum possible pressure.")
+      ''' Compute loose lower bound on pressure due to gravity. '''
+      # Lower bound pressure
+      yMax = self.yWt - self.x_sat(p_vent) * (
+        1.0 - self.yC - self.yWt - self.yA)
+      # Compute maximum water vapour volume
+      vwMax = 1.0 / p_vent * self.mixture.waterEx.R * self.T_chamber
+      # Compute maximum mixture volume
+      vMax = yMax * vwMax + (1 - yMax) * self.mixture.magma.v_pT(p_vent, None)
+      p_minbound = p_vent + self.conduit_length * 9.8 /  vMax
+
+      ''' Find lowest-pressure continuous solution '''
+      p0 = p_minbound
+      for k in range(N_doubling):
+        # Compute IVP solution
+        
+        p_chamber = p0*2**k
+        j0 = j0_u(p_chamber)
+        _out = self.solve_ssIVP(p0*2**k, j0)
+        p_top = _out[1][0,-1]
+        x_top = _out[0][-1]
+        # ''' Top pressure and pressure grad check'''
+        # q_top = _out[1][:,-1]
+        # dqdx = np.linalg.solve(self.A(*q_top, j0), self.F(q_top)).flatten()
+        # dpdx = dqdx[0]
+        # # Tolerable distance-to-zero-pressure
+        # p_min = 0.001e6 # 1 mbar
+        # dx_min = 1.0    # 1 m until zero pressure
+        # is_reached_vacuum = p_top < p_min or p_top/np.abs(dpdx) < dx_min
+        # Search criterion
+        if x_top >= self.x_mesh[-1]:
+          break
+      else:
+        raise Exception("Could not bracket lower pressure limit.")
+
+      def bisect_pmin(a,b):
+        ''' Manual bisection for minimum pressure. '''
+        fn_x_top = lambda p: self.solve_ssIVP(p, j0_u(p))[0][-1]
+        # Reject if continuous solution at low bracketing pressure
+        if fn_x_top(a) >= self.x_mesh[-1]:
+          raise ValueError(f"Pressure {a} is a continuous solution.")
+        # Reject if no continuous solution at high bracketing pressure
+        if fn_x_top(b) < self.x_mesh[-1]:
+          raise ValueError(f"Pressure {b} is not a continuous solution.")
+
+        abs_tol = 1e-1
+        m = 0.5*(a+b)
+
+        while b - a > abs_tol:
+          # Search criterion
+          if fn_x_top(m) >= self.x_mesh[-1]: # Continuous solution found
+            b = m
+          else:
+            a = m
+          m = 0.5*(a+b)
+        return b # Continuous solution
+      # Compute minimum possible chamber pressure
+      pc_min = bisect_pmin(p0*2**k/2, p0*2**k)
+      # Compute corresponding minimum vent pressure
+      p_vent_min = self.solve_ssIVP(pc_min, j0_u(pc_min))[1][0,-1]
+      print(f"Minimum vent pressure is {p_vent_min}.")
+      if p_vent <= p_vent_min:
+        print("Choked flow.")
+        z = pc_min
+        x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
+      else:
+        # Unchoked
+        print("Pressure matching for vent pressure at given velocity.")
+        # Define wrapped objective taking into subpressurized flow
+        def objective(z):
+          soln = solve_kernel(z)
+          # Retrieve 
+          z_top = soln[0][-1]
+          p_top = soln[1][0,-1]
+          return p_top - p_vent if z_top >= self.x_mesh[-1] else -p_vent
+        z = scipy.optimize.brenth(objective, pc_min, z_max)
+        x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
 
     if verbose:
       # Package extra details on calculation.
