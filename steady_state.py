@@ -27,7 +27,7 @@ import numpy as np
 import scipy
 import scipy.integrate
 import matplotlib.pyplot as plt
-import material_properties as matprops
+import compressible_conduit_steady.material_properties as matprops
 
 # DONE: TEST: why is the limit tau_d -> Infty giving negative exsolved mass?
 #  -- too much pressure loss before it reaches the top. Events p->0, h->0 added.
@@ -45,7 +45,8 @@ import material_properties as matprops
 
 class SteadyState():
 
-  def __init__(self, p_vent:float, inlet_input_val:float, input_type:str="u", override_properties:dict=None):
+  def __init__(self, p_vent:float, inlet_input_val:float, input_type:str="u",
+    override_properties:dict=None):
     ''' 
     Steady state ODE solver.
     Inputs:
@@ -57,6 +58,11 @@ class SteadyState():
         section of __init__ for overridable properties.
     Call this object to sample the solution at a grid x, consistent with the
     provided value of conduit_length.
+    Providing the number of elements at initialization helps, since no
+    re-evaluation of the numerical solution is required. Re-evaluation risks
+    perturbing the location of a sonic boundary. A one-node correction is
+    included against this case, extrapolating the value at the vent. See
+    __call__ for this implementation.
     '''
     # Validate properties
     if override_properties is None:
@@ -71,13 +77,14 @@ class SteadyState():
     #   1e-5 is 10 ppm
     self.yWvInletMin    = override_properties.pop("yWvInletMin", 1e-5)
     # Crystal content (mass fraction; must be less than yl = 1.0 - ywt)
-    self.yC             = override_properties.pop("yC", 0.00)
+    self.yC             = override_properties.pop("yC", 0.01)
+    self.yCMin          = override_properties.pop("yCMin", 1e-5)
     # Critical volume fraction
     self.crit_volfrac   = override_properties.pop("crit_volfrac", 0.7)
     # Exsolution timescale
     self.tau_d          = override_properties.pop("tau_d", 1.0)
     # Viscosity (Pa s)
-    self.mu             = override_properties.pop("mu", 5e2)
+    self.mu             = override_properties.pop("mu", 1e5)
     # Conduit dimensions (m)
     self.conduit_radius = override_properties.pop("conduit_radius", 50)
     self.conduit_length = override_properties.pop("conduit_length", 4000)
@@ -90,6 +97,12 @@ class SteadyState():
     self.p0_magma       = override_properties.pop("p0_magma", 10e6)
     self.solubility_k   = override_properties.pop("solubility_k", 5e-6)
     self.solubility_n   = override_properties.pop("solubility_n", 0.5)
+    # Number of evaluation points for ODE solver
+    self.N_x            = override_properties.pop("NumElems", 200) + 1
+
+    # Debug option (caches AinvRHS, source term F as lambdas that cannot be
+    # pickled by the default pickle module)
+    self._DEBUG = False
 
     # Input validation
     if self.yC + self.yA + self.yWt > 1:
@@ -102,8 +115,6 @@ class SteadyState():
 
     # Set depth of conduit inlet (0 is surface)
     self.x0 = -self.conduit_length
-    # Number of evaluation points for ODE solver
-    self.N_x = 200
 
     # Set mixture properties
     mixture = matprops.MixtureMeltCrystalWaterAir()
@@ -112,24 +123,41 @@ class SteadyState():
     mixture.k, mixture.n = self.solubility_k, self.solubility_n
     self.mixture = mixture
 
-    # Define functions in terms of (p, h, y)
-    yA, yWt, yC = self.yA, self.yWt, self.yC
-    self.T_ph  = lambda p, h, y: mixture.T_ph(p, h, yA, y, 1.0-y-yA)
-    self.v_mix = lambda p, T, y: mixture.v_mix(p, T, yA, y, 1.0-y-yA)
-    self.dv_dp = lambda p, T, y: mixture.dv_dp(p, T, yA, y, 1.0-y-yA)
-    self.dv_dh = lambda p, T, y: mixture.dv_dh(p, T, yA, y, 1.0-y-yA)
-    self.dv_dy = lambda p, T, y: mixture.dv_dy(p, T, yA, y, 1.0-y-yA)
-    self.vf_g  = lambda p, T, y: mixture.vf_g(p, T, yA, y, 1.0-y-yA)
-    self.x_sat = lambda p: mixture.x_sat(p)
-    self.y_wv_eq = lambda p: mixture.y_wv_eq(p, yWt, yC)
-
     # Set default mesh
     self.x_mesh = np.linspace(self.x0, 0, self.N_x)
     # Run once at the provided values
     self._set_cache(p_vent, inlet_input_val, input_type=input_type)
 
     # RHS function cache
-    self.F = None
+    if self._DEBUG:
+      self.F = None
+
+    ''' Thermo functions in terms of (p, h, y)'''
+
+  def T_ph(self, p, h, y):
+    return self.mixture.T_ph(p, h, self.yA, y, 1.0-y-self.yA)
+
+  def v_mix(self, p, T, y):
+    return self.mixture.v_mix(p, T, self.yA, y, 1.0-y-self.yA)
+
+  def dv_dp(self, p, T, y):
+    return self.mixture.dv_dp(p, T, self.yA, y, 1.0-y-self.yA)
+
+  def dv_dh(self, p, T, y):
+    return self.mixture.dv_dh(p, T, self.yA, y, 1.0-y-self.yA)
+
+  def dv_dy(self, p, T, y):
+    return self.mixture.dv_dy(p, T, self.yA, y, 1.0-y-self.yA)
+
+  def vf_g (self, p, T, y):
+    return self.mixture.vf_g(p, T, self.yA, y, 1.0-y-self.yA)
+
+  def x_sat(self, p):
+    return self.mixture.x_sat(p)
+
+  def y_wv_eq(self, p):
+    return self.mixture.y_wv_eq(p, self.yWt, self.yC)
+
 
   def A(self, p, h, y, j0):
     ''' Returns coefficient matrix to ODE (A in A dq/dx = f(q)). '''
@@ -220,8 +248,9 @@ class SteadyState():
       F[0] = F_rho(p, T, y, rho) 
       F[2] = Y(p, y)
       return F
-    # Cache source term
-    self.F = F
+    if self._DEBUG:  
+      # Cache source term (cannot be pickled with default pickle module)
+      self.F = F
 
     ''' Set ODE RHS A^{-1} F '''
     def AinvRHS_numinv(x, q):
@@ -322,9 +351,10 @@ class SteadyState():
     # Set chamber (inlet) condition (p, h, y) with y = y_eq at pressure
     q0 = np.array([p_chamber, h_chamber, yWvInlet])
 
-    # Cache ODE details
-    self.ivp_inputs = (AinvRHS, (self.x_mesh[0],self.x_mesh[-1]), q0, self.x_mesh, "Radau",
-      [EventChoked(), ZeroPressure(), ZeroEnthalpy(), PositivePressureGradient(AinvRHS)])
+    if self._DEBUG:
+      # Cache ODE details
+      self.ivp_inputs = (AinvRHS, (self.x_mesh[0],self.x_mesh[-1]), q0, self.x_mesh, "Radau",
+        [EventChoked(), ZeroPressure(), ZeroEnthalpy(), PositivePressureGradient(AinvRHS)])
     # Call ODE solver
     if j0 > 0:
       soln = scipy.integrate.solve_ivp(AinvRHS, (self.x_mesh[0],self.x_mesh[-1]), q0, t_eval=self.x_mesh, method="Radau",
@@ -366,17 +396,30 @@ class SteadyState():
       return self.solve_ssIVP(self.p_chamber, self.j0)[1]
     else:
       p, h, y = self.solve_ssIVP(self.p_chamber, self.j0)[1]
+
+      # Correction for mesh perturbation (correct for up to one node)
+      if len(y.ravel()) == len(self.x_mesh) - 1:
+        # Extrapolate
+        p, h, y = np.hstack((p, 2*p[-1] + p[-2])), \
+          np.hstack((h, 2*h[-1] + h[-2])), np.hstack((y, 2*y[-1] + y[-2]))
+
+      # Mass fraction correction
+      y = np.where(y < 0, self.yWvInletMin, y)
+      # Crystallinity correction
+      yC = np.max((self.yC, self.yCMin))
+
       T = self.T_ph(p, h, y)
       v = self.v_mix(p, T, y)
-      # Load and return state vector
-      U = np.zeros((*x.shape,7))
+      # Load and return conservative state vector
+      U = np.zeros((*x.shape,8))
       U[...,0] = self.yA / v
       U[...,1] = y / v
       U[...,2] = (1.0 - y - self.yA) / v
       U[...,3] = self.j0
       U[...,4] = 0.5 * self.j0**2 * v + h/v - p
       U[...,5] = self.yWt / v
-      U[...,6] = self.yC / v
+      U[...,6] = yC / v
+      U[...,7] = 0.0 # Fragmented magma condition
       return U
 
   def solve_steady_state_problem(self, p_vent:float, inlet_input_val:float,
