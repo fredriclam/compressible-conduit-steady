@@ -494,6 +494,200 @@ class RedlichKwongConstHeat(ThermodynamicMaterial):
     }
   
 
+class EmpiricalRedlichKwongConstB(ThermodynamicMaterial):
+  ''' Empirical Redlich-Kwong equation of state with parametrization
+  for geological use by Holloway (1977) used together with a constant
+  ideal-gas-part of heat capacity.
+  
+  Two-parameter Redlich-Kwong:
+            RT         a
+   p =   ------ - ------------
+          V - b               _
+                  V(V + b) \/T
+  where a = a(T), and b is constant.
+  '''
+  def __init__(self, cache_tol=1e-14):
+    ''' Set water properties and set cache tolerance. Cache tolerance is used
+    to check if volume needs to be recomputed for given input values to
+    methods. '''
+    # Set reference e, p, T triple for energy from fit range
+    self.p0_MPa = 525 # MPa
+    self.T0 = 510 + 273.15 # K
+    # Define molar universal gas constant (J / mol K)
+    self.R_mol = 8.3143
+    # Molar mass
+    self.mm = 18.02e-3 # kg/mol
+    # Critical properties of water for nondimensionalization
+    self.rho_c = 322           # kg/m^3
+    self.V_c = 1e6/(self.rho_c/self.mm)  # cm^3/mol
+    self.T_c = 647.096
+    # Set ideal gas part of heat capacity (function of T only)
+    self.c_p = 3880          # Average value of Degruyter & Huber
+    self.c_v = self.c_p - self.R_mol/self.mm
+    self.c_v_mol, self.c_p_mol = self.c_v * self.mm, self.c_p * self.mm
+    self.R, self.gamma = self.R_mol/self.mm, self.c_p / self.c_v
+    # Initialize cache for molar volume
+    self.cache_tol = cache_tol
+    self._cache_pT = (None, None)
+    self._cache_vals = None
+    # Top cache values that would be used: specific volume, compressibility at (p,T)
+    self._v = None
+    self._Z = None
+  
+  @property
+  def c_v(self, T, v):
+    # Precompute power terms
+    powers_T_Celsius = [1, (T-273.15), (T-273.15)**2, (T-273.15)**3]
+    # Compute coefficients
+    coeffs_a_Celsius = [166.8e6, -193080, 186.4, -0.071288]
+    coeffs_dadT_Celsius = [-193080, 2*186.4, 3*-0.071288, 0]
+    coeffs_ddadT2_Celsius = [2*186.4, 6*-0.071288, 0, 0]
+    a = np.dot(powers_T_Celsius, coeffs_a_Celsius)
+    da = np.dot(powers_T_Celsius, coeffs_dadT_Celsius)
+    dda = np.dot(powers_T_Celsius, coeffs_ddadT2_Celsius)
+    macro_coeffs = np.array([3/4, -T, T*T])/T**1.5
+    # Compute molar volume
+    Vmol = 1e6 * v * self.mm # cm^3/mol
+    b = 14.6 # cm^3/mol
+    return self._c_v - np.dot(np.array(macro_coeffs, [a, da, dda])) * np.log(Vmol/(Vmol+b))
+  
+  @property
+  def c_p(self):
+    raise NotImplementedError("Implement c_p in terms of c_v, Z.")
+    return self._c_p
+  
+  def e_pT(self, p ,T):
+    self._check_and_precompute(p, T)
+    return self._cache_vals["specific"]["e"]
+
+  def h_pT(self, p, T):
+    self._check_and_precompute(p, T)
+    return self._cache_vals["specific"]["h"]
+  
+  def v_pT(self, p, T):
+    self._check_and_precompute(p, T)
+    return self._v
+
+  def dv_dp_isoT_pT(self, p, T):
+    raise NotImplementedError
+
+  def dv_dT_isop_pT(self, p, T):
+    raise NotImplementedError
+
+  def dp_drho_isos_pT(self, p, T):
+    raise NotImplementedError
+  
+  def _check_and_precompute(self, p, T) -> None:
+    ''' Validates cache for given p, T. If the cached value is stale,
+    precomputes molar volume and energies at p, T.'''
+    
+    if np.any([val is None for val in self._cache_pT]) or \
+      (p - self._cache_pT[0])**2 + (T - self._cache_pT[1])**2 > self.cache_tol**2:
+      # Cache is stale; update is needed.
+      self._cache_pT = (p, T)
+    else:
+      # Use cached values
+      return
+
+    ''' Compute values '''
+    # Unpack
+    R, V_c = self.R_mol, self.V_c
+    # Pa -> MPa -> bar
+    p = p * 1e-6 * 1e1
+    # Precompute power terms
+    powers_T_Celsius = [1, (T-273.15), (T-273.15)**2, (T-273.15)**3]
+    # Compute coefficients
+    coeffs_a_Celsius = [166.8e6, -193080, 186.4, -0.071288]
+    coeffs_dadT_Celsius = [-193080, 2*186.4, 3*-0.071288, 0]
+    b = 14.6
+    a = np.dot(coeffs_a_Celsius, powers_T_Celsius)
+    dadT = np.dot(coeffs_dadT_Celsius, powers_T_Celsius)
+    # Define compressibility form
+    Z_fn = lambda V: V/(V-b) - 1e-1 * a / (R*T*(V+b)*np.sqrt(T))
+    # Cubic form for molar density (cm^3/mol), w.r.t pressure in J/cc, T in K
+    poly = [1e-1*p, -R*T, -(b*b*(1e-1*p) + R*T*b - (1e-1*a)/np.sqrt(T)),
+      -(1e-1*a)*b/np.sqrt(T)]
+    # Dimensional vector (poly*dimensonals -> Pa cm^9 / mol^3 == J cc^2 / mol^3)
+    dimensionals = [V_c**3, V_c**2, V_c, 1]
+    # Define polynomial coefficients to nondimensional cubic for molar volume (V/V_c)
+    poly_scaled = np.asarray(poly) * np.asarray(dimensionals)
+    poly_scaled /= poly_scaled[0]
+
+    # Solve cubic equation for nondimensional molar volume
+    V_roots = np.roots(poly_scaled)
+    # Filter roots: real root, V >= b
+    V = np.array([np.real(root) for root in V_roots
+      if np.isreal(root) and root*V_c >= b])
+    # Filter roots: take gas-like for subcritical conditions
+    is_using_sub_crit_filter = False
+    if len(V) > 1:
+      is_using_sub_crit_filter = True
+      V = V[np.argmin(np.abs(Z_fn(V*V_c)-1))]
+    # Cast possible array to float (np.array, float -> float, raise for list)
+    V = float(V)
+
+    # Reconstruct pressure for verification
+    # p_test = [(R*T/(root*V_c - b) - 1e-1*a / (root*V_c*(root*V_c+b)*np.sqrt(T))).astype(str) + " MPa" for root in V]
+    p_test = (R*T/(V*V_c - b) - 1e-1*a / (V*V_c*(V*V_c+b)*np.sqrt(T))).astype(str) + " MPa"
+
+    # Cache compressibility factor
+    Z = 1e-1 * p*(V*V_c) / (R*T)
+    self._Z = Z 
+
+    ''' Compute departure functions. '''
+    # Molar departure quantities divided by RT
+    #   (conversion bar * cc / mol == 1e-1 J / mol)
+    #   (b has units: (cc/mol)^2 * T^(1/2) * bar)
+    #   (b has units of V*V_c: cc/mol)
+    # Compute departure quantities (Q - Q{ig}) / RT
+    e_dep_nondim = lambda T: 1e-1 * (1.5*a - dadT*T)/ (b*R*T*np.sqrt(T)) * np.log((V*V_c)/(V*V_c+b))
+    h_dep_nondim = lambda T: e_dep_nondim(T) + 1 - Z
+    # Constant heat capacity model
+    c_p = 3880*self.mm # 3880 J / kgK -> J / mol K
+    h_ideal = self.c_p_mol * (T - self.T_c)
+    e_ideal = (self.c_p_mol - R) * (T - self.T_c)
+    h_total = h_ideal + R*T*h_dep_nondim
+    e_total = e_ideal + R*T*e_dep_nondim
+
+    # Compute mass-specific volume (m^3/kg)
+    v = 1e-6 * V * V_c / self.mm
+
+    # Cache top values
+    self._v = V
+    self._Z = Z
+    # Cache debug values
+    self._cache_vals = {
+      "molarSI": {
+        "h_ideal": h_ideal,
+        "e_ideal": e_ideal,
+        "h": h_total,
+        "e": e_total,
+        "v": 1e-6*V*V_c,
+      },
+      "specific": {
+        "h_ideal": h_ideal / self.mm,
+        "e_ideal": e_ideal / self.mm,
+        "h": h_total / self.mm,
+        "e": e_total / self.mm,
+        "v": v,
+      },
+      "Z": Z,
+      "debug": {
+        "Z_check": Z_fn(V*V_c),
+        "a": a,
+        "b": b,
+        "V_c": V_c,
+        "rho_c": self.rho_c,
+        "c_p_molar": c_p,
+        "V": V,
+        "poly_scaled": poly_scaled,
+        "V_roots": V_roots,
+        "p_test": p_test,
+        "is_using_sub_crit_filter": is_using_sub_crit_filter,
+      }
+    }
+  
+
 class IAPWSWater(ThermodynamicMaterial):
   pass
 
