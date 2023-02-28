@@ -96,7 +96,7 @@ class SteadyState():
     self.c_v_magma      = override_properties.pop("c_v_magma", 3e3)
     self.rho0_magma     = override_properties.pop("rho0_magma", 2.7e3)
     self.K_magma        = override_properties.pop("K_magma", 10e9)
-    self.p0_magma       = override_properties.pop("p0_magma", 10e6)
+    self.p0_magma       = override_properties.pop("p0_magma", 5e6)
     self.solubility_k   = override_properties.pop("solubility_k", 5e-6)
     self.solubility_n   = override_properties.pop("solubility_n", 0.5)
     # Number of evaluation points for ODE solver
@@ -217,7 +217,9 @@ class SteadyState():
     # mu = self.mu
     mu = self.F_fric_viscosity_model(T, y, yF)
 
-    frag_factor = np.clip(1.0 - yF/self.yL, 0.0, 1.0)
+    # Compute fractional indicator using yF / yM (liquid phase, not liquid melt)
+    yM = 1.0 - self.yA - y
+    frag_factor = np.clip(1.0 - yF/yM, 0.0, 1.0)
     return -8.0*mu/self.conduit_radius**2 * u * frag_factor
 
   def F_fric_viscosity_model(self, T, y, yF) -> float:
@@ -302,10 +304,11 @@ class SteadyState():
       rho = 1.0/self.v_mix(p, T, y)
       # Compute (constant) liquid melt fraction
       yL = 1.0 - self.yWt - self.yC - self.yA
+      yM = 1.0 - self.yA - y
       # Compute source vector
       F[0] = F_rho(p, T, y, yF, rho) 
       F[2] = Y(p, y)
-      F[3] = (yL - yF) / self.tau_f * float(self.vf_g(p, T, y) >= self.crit_volfrac)
+      F[3] = (yM - yF) / self.tau_f * float(self.vf_g(p, T, y) >= self.crit_volfrac)
       return F
     if self._DEBUG:  
       # Cache source term (cannot be pickled with default pickle module)
@@ -456,8 +459,10 @@ class SteadyState():
     self.x_mesh = x
     # Check that input x is consistent with internal length
     if np.abs((x.max() - x.min()) / self.conduit_length - 1.0) > 1e-7:
-      raise Exception(
-        f"Input x did not correspond to conduit length at initialization.")
+      # Try padding for p0
+      print(
+        f"Warning: input x did not correspond to conduit length at initialization." +
+        f"If ElementOrder == 0, this is probably fine.")
     if is_return_raw_phy:
       # Return solution state (p, h, y)
       return self.solve_ssIVP(self.p_chamber, self.j0)[1]
@@ -469,8 +474,10 @@ class SteadyState():
       # solver can result in choking below the vent.
       if len(y.ravel()) == len(self.x_mesh) - 1:
         # Extrapolate
-        p, h, y = np.hstack((p, 2*p[-1] + p[-2])), \
-          np.hstack((h, 2*h[-1] + h[-2])), np.hstack((y, 2*y[-1] + y[-2]))
+        p, h, y, yF = np.hstack((p, 2*p[-1] + p[-2])), \
+          np.hstack((h, 2*h[-1] + h[-2])), \
+          np.hstack((y, 2*y[-1] + y[-2])), \
+          np.hstack((yF, 2*y[-1] + yF[-2]))
 
       # Mass fraction correction
       y = np.where(y < 0, self.yWvInletMin, y)
