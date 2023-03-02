@@ -474,10 +474,10 @@ class SteadyState():
       # solver can result in choking below the vent.
       if len(y.ravel()) == len(self.x_mesh) - 1:
         # Extrapolate
-        p, h, y, yF = np.hstack((p, 2*p[-1] + p[-2])), \
-          np.hstack((h, 2*h[-1] + h[-2])), \
-          np.hstack((y, 2*y[-1] + y[-2])), \
-          np.hstack((yF, 2*y[-1] + yF[-2]))
+        p, h, y, yF = np.hstack((p, 2*p[-1] - p[-2])), \
+          np.hstack((h, 2*h[-1] - h[-2])), \
+          np.hstack((y, 2*y[-1] - y[-2])), \
+          np.hstack((yF, 2*y[-1] - yF[-2]))
 
       # Mass fraction correction
       y = np.where(y < 0, self.yWvInletMin, y)
