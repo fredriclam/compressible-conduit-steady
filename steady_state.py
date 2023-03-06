@@ -33,21 +33,25 @@ import compressible_conduit_steady.material_properties as matprops
 # DONE: TEST: why is the limit tau_d -> Infty giving negative exsolved mass?
 #  -- too much pressure loss before it reaches the top. Events p->0, h->0 added.
 
-# WARNING: setting u may have multiple possible p_chambers. This corresponds to
-# a different position of the exsolution front
-# also, use local space variables everywhere instead of param=.
-# print->log
-# plot interactive checks
-# matprops interactive checks, thermopotential surface plotting
+# TODO: print->log
+# TODO: plot interactive checks
+# TODO in material_properties: interactive checks, thermopotential surface plotting
 
 
 class SteadyState():
 
-  def __init__(self, p_vent:float, inlet_input_val:float, input_type:str="u",
-    override_properties:dict=None):
+  # Global caching: if checkhash and pressure match, re-use value
+  checkhash = 0
+  last_crit_inputs = np.array([0, 0, 0, 0])
+  cached_j0_p = (None, None)
+
+  def __init__(self, x_global:np.array, p_vent:float, inlet_input_val:float,
+    input_type:str="u", override_properties:dict=None):
     ''' 
     Steady state ODE solver.
     Inputs:
+      x_global: global x coordinates (necessary to coordinate solution between
+        several 1D patches)
       p_vent: vent pressure (if small enough, expect flow choking).
       inlet_input_val: chamber inlet value of velocity u, pressure p, or mass
         flux j. Provide the corresponding type in input_type.
@@ -89,7 +93,6 @@ class SteadyState():
     self.mu             = override_properties.pop("mu", 1e5)
     # Conduit dimensions (m)
     self.conduit_radius = override_properties.pop("conduit_radius", 50)
-    self.conduit_length = override_properties.pop("conduit_length", 4000)
     # Chamber conditions
     self.T_chamber      = override_properties.pop("T_chamber", 800+273.15)
     # Gas properties
@@ -99,13 +102,17 @@ class SteadyState():
     self.p0_magma       = override_properties.pop("p0_magma", 5e6)
     self.solubility_k   = override_properties.pop("solubility_k", 5e-6)
     self.solubility_n   = override_properties.pop("solubility_n", 0.5)
-    # Number of evaluation points for ODE solver
-    self.N_x            = override_properties.pop("NumElems", 200) + 1
 
     # Debug option (caches AinvRHS, source term F as lambdas that cannot be
     # pickled by the default pickle module)
     self._DEBUG = False
 
+    # Output mesh
+    self.x_mesh = x_global.copy()
+    # Internal computation mesh
+    self.x_mesh_native = x_global.copy()
+
+    self.conduit_length = x_global.max() - x_global.min()
     # Compute liquid melt fraction
     self.yL = 1.0 - (self.yC + self.yA + self.yWt)
 
@@ -121,8 +128,8 @@ class SteadyState():
       raise ValueError(
         f"Unused override properties:{list(override_properties.keys())}")
 
-    # Set depth of conduit inlet (0 is surface)
-    self.x0 = -self.conduit_length
+    # Set depth of conduit inlet
+    self.x0 = x_global.min()
 
     # Set mixture properties
     mixture = matprops.MixtureMeltCrystalWaterAir()
@@ -131,16 +138,25 @@ class SteadyState():
     mixture.k, mixture.n = self.solubility_k, self.solubility_n
     self.mixture = mixture
 
-    # Set default mesh
-    self.x_mesh = np.linspace(self.x0, 0, self.N_x)
-    # Run once at the provided values
-    self._set_cache(p_vent, inlet_input_val, input_type=input_type)
+    # Check static cache
+    propshash = hash(tuple(override_properties.items()))
+    inputs_array = np.array([x_global.min(), x_global.max(), 
+      p_vent, inlet_input_val])
+    if propshash == SteadyState.checkhash \
+      and np.all(inputs_array == SteadyState.last_crit_inputs):
+      self.j0, self.p_chamber = SteadyState.cached_j0_p
+    else:
+      SteadyState.checkhash = propshash
+      SteadyState.last_crit_inputs = inputs_array.copy()
+      # Run once at the provided values
+      self._set_cache(p_vent, inlet_input_val, input_type=input_type)
+      SteadyState.cached_j0_p = (self.j0, self.p_chamber)
 
     # RHS function cache
     if self._DEBUG:
       self.F = None
 
-    ''' Thermo functions in terms of (p, h, y)'''
+  ''' Define partially evaluated thermo functions in terms of (p, h, y)'''
 
   def T_ph(self, p, h, y):
     return self.mixture.T_ph(p, h, self.yA, y, 1.0-y-self.yA)
@@ -166,9 +182,8 @@ class SteadyState():
   def y_wv_eq(self, p):
     return self.mixture.y_wv_eq(p, self.yWt, self.yC)
 
-
   def A(self, p, h, y, yf, j0):
-    ''' Returns coefficient matrix to ODE (A in A dq/dx = f(q)).
+    ''' Return coefficient matrix to ODE (A in A dq/dx = f(q)).
     Coefficient matrix has block structure:
     [_ _ _ 0] [p ]
     [_ _ 0 0] [h ]
@@ -189,14 +204,16 @@ class SteadyState():
     A[3,:] = [0, 0, 0, j0*v]
     return A
 
-  ''' Define eigenvalues of A '''
   def eigA(self, p, h, y, yF, j0):
-    '''The eigenvalues are 
+    ''' Return array of eigenvalues of A, which consists of the pair
+      l1 = 0.5 * j0^2 * (dv/dp)_{h,y} -
+        0.5 * sqrt((j0^2 dv/dp)^2 + 4(1 + j0^2 dv/dp + v j0^2 (dv/dh)) ),
+      l2 = 0.5 * j0^2 * (dv/dp)_{h,y} +
+        0.5 * sqrt((j0^2 dv/dp)^2 + 4(1 + j0^2 dv/dp + v j0^2 (dv/dh)) ),
+    and
       u, u,
-    which transports the chemical state (dy/dx), and the pair
-      0.5 * j0^2 * (dv/dp)_{h,y} + 0.5 * sqrt((j0^2 dv/dp)^2 + 4(1 + j0^2 dv/dp + v j0^2 (dv/dh)) ),
-      0.5 * j0^2 * (dv/dp)_{h,y} - 0.5 * sqrt((j0^2 dv/dp)^2 + 4(1 + j0^2 dv/dp + v j0^2 (dv/dh)) ).
-    This conjugate pair replaces the usual isentropic sound speed eigenvalues.
+    which transport the chemical state (dy/dx). The conjugate pair eigenvalues
+    replace the usual isentropic sound speed eigenvalues.
     ''' 
     # Evaluate mixture state
     T = self.T_ph(p, h, y)
@@ -211,7 +228,6 @@ class SteadyState():
   
   def F_fric(self, p, T, y, yF, rho, u) -> float:
     ''' Friction (force per unit volume)'''
-    # is_frag = float(self.vf_g(p, T, y) > self.crit_volfrac)
 
     # Poll friction model
     # mu = self.mu
@@ -219,6 +235,8 @@ class SteadyState():
 
     # Compute fractional indicator using yF / yM (liquid phase, not liquid melt)
     yM = 1.0 - self.yA - y
+    # Continuous alternative to float(self.vf_g(p, T, y) > self.crit_volfrac)
+
     frag_factor = np.clip(1.0 - yF/yM, 0.0, 1.0)
     return -8.0*mu/self.conduit_radius**2 * u * frag_factor
 
@@ -266,7 +284,6 @@ class SteadyState():
     yA, yWt, yC, crit_volfrac, mu, tau_d, tau_f, conduit_radius, T_chamber = \
       self.yA, self.yWt, self.yC, self.crit_volfrac, self.mu, self.tau_d, \
       self.tau_f, self.conduit_radius, self.T_chamber
-    x0, N_x = self.x0, self.N_x
     yFInlet = self.yFInlet
     # Compute auxiliary inlet conditions
     yWvInlet = np.clip(self.y_wv_eq(p_chamber), self.yWvInletMin, None)
@@ -450,53 +467,70 @@ class SteadyState():
     self.j0 = calc_details["j0"]
     self.p_chamber = calc_details["p"]
   
-  def __call__(self, x:np.array, is_return_raw_phy:bool=False) -> np.array:
+  def __call__(self, x:np.array, output_format:str="quail") -> np.array:
     '''Returns U sampled on x in quail format (default).
-    Requires x to be consistent in length with conduit.length when
-    _set_cache is called.
+    Requires x to be points in interval [self.x_mesh.min(), self.x_mesh.max()].
     ''' 
-    # Save mesh as side effect
-    self.x_mesh = x
     # Check that input x is consistent with internal length
-    if np.abs((x.max() - x.min()) / self.conduit_length - 1.0) > 1e-7:
-      # Try padding for p0
-      print(
-        f"Warning: input x did not correspond to conduit length at initialization." +
-        f"If ElementOrder == 0, this is probably fine.")
-    if is_return_raw_phy:
+    if x.max() > self.x_mesh.max() \
+      or x.min() < self.x_mesh.min():
+      raise ValueError("Requested values at x not in initial global mesh.")
+    # Save union of x, x_mesh_native as output mesh. This is required if
+    # sampling over a subregion of the entire conduit domain.
+    self.x_mesh = np.union1d(x.ravel(), self.x_mesh_native)
+
+    # Compute solution in requested format
+    if "phy".casefold() == output_format.casefold() \
+       or "native".casefold() == output_format.casefold():
       # Return solution state (p, h, y)
       return self.solve_ssIVP(self.p_chamber, self.j0)[1]
-    else:
+    elif "quail".casefold() == output_format.casefold():
+      # Solve steady state IVP with union mesh and precomputed mass flux
       p, h, y, yF = self.solve_ssIVP(self.p_chamber, self.j0)[1]
-
-      # Correction for mesh perturbation (correct for up to one node)
+      # Correct for mesh perturbation (correct for up to one node)
       # If the flow is close to vent-choked, numerical perturbation to the IVP
-      # solver can result in choking below the vent.
+      # solver can result in choking below the vent. Extrapolation may be
+      # necessary to obtain a solution up to the last node in the mesh.
       if len(y.ravel()) == len(self.x_mesh) - 1:
         # Extrapolate
         p, h, y, yF = np.hstack((p, 2*p[-1] - p[-2])), \
           np.hstack((h, 2*h[-1] - h[-2])), \
           np.hstack((y, 2*y[-1] - y[-2])), \
           np.hstack((yF, 2*y[-1] - yF[-2]))
-
+      
+      ''' Construct conservative state vector in union mesh.
+      The variable U stores the solution in the union of the sample mesh x and
+      the domain representation self.x_mesh_native.
+      '''
       # Mass fraction correction
       y = np.where(y < 0, self.yWvInletMin, y)
       # Crystallinity correction
       yC = np.max((self.yC, self.yCMin))
-
+      # Compute mixture intermediates
       T = self.T_ph(p, h, y)
       v = self.v_mix(p, T, y)
       # Load and return conservative state vector
-      U = np.zeros((*x.shape,8))
+      U = np.zeros((*self.x_mesh.shape,8))
       U[...,0] = self.yA / v
       U[...,1] = y / v
       U[...,2] = (1.0 - y - self.yA) / v
       U[...,3] = self.j0
       U[...,4] = 0.5 * self.j0**2 * v + h/v - p
       U[...,5] = self.yWt / v
-      U[...,6] = self.yC / v
+      U[...,6] = yC / v
       U[...,7] = yF / v
-      return U
+
+      ''' Extract only values of U that correspond to query locations x. '''
+      # Define associative map from value of x to state vector U
+      vals = {x: U[i,:] for i, x in enumerate(self.x_mesh)}
+      U_out = np.zeros((*x.shape[:2],8))
+      # Map sample locations to state values U
+      for i in range(U_out.shape[0]):
+        for j in range(U_out.shape[1]):
+          U_out[i,j,:] = vals[x[i,j,0]]
+      return U_out
+    else:
+      raise ValueError(f"Unknown output format string '{output_format}'.")
 
   def solve_steady_state_problem(self, p_vent:float, inlet_input_val:float,
     input_type:str="u", verbose=False):
@@ -731,7 +765,7 @@ class SteadyState():
 if __name__ == "__main__":
   ''' Perform unit test '''
 
-  ss = SteadyState()
+  ss = SteadyState(np.linspace(-3000,0,200))
   p_range = np.linspace(1e5, 10e6, 50)
   results_varp = [ss.solve_ssIVP(p_chamber=p_chamber, j0=2700*1.0) for p_chamber in p_range]
   print(results_varp[0])
