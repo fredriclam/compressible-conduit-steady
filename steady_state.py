@@ -50,7 +50,8 @@ class SteadyState():
   cached_j0_p = (None, None)
 
   def __init__(self, x_global:np.array, p_vent:float, inlet_input_val:float,
-    input_type:str="u", override_properties:dict=None):
+    input_type:str="u", override_properties:dict=None,
+    use_static_cache:bool=False):
     ''' 
     Steady state ODE solver.
     Inputs:
@@ -62,6 +63,10 @@ class SteadyState():
       input_type: "u", "p", or "j" as provided by user.
       override_properties (dict): map from property name to value. See first
         section of __init__ for overridable properties.
+      use_static_cache: If use_static_cache is True, inlet condition
+        determination is not done again if the solution was already computed
+        by any instance of SteadyState and the existing checkhash and
+        critical inputs match the saved run.
     Call this object to sample the solution at a grid x, consistent with the
     provided value of conduit_length.
     Providing the number of elements at initialization helps, since no
@@ -111,6 +116,8 @@ class SteadyState():
     # pickled by the default pickle module)
     self._DEBUG = False
 
+    self.use_static_cache = use_static_cache
+
     # Output mesh
     self.x_mesh = x_global.copy()
     # Internal computation mesh
@@ -146,7 +153,8 @@ class SteadyState():
     propshash = hash(tuple(override_properties.items()))
     inputs_array = np.array([x_global.min(), x_global.max(), 
       p_vent, inlet_input_val])
-    if propshash == SteadyState.checkhash \
+    if use_static_cache \
+      and propshash == SteadyState.checkhash \
       and np.all(inputs_array == SteadyState.last_crit_inputs):
       self.j0, self.p_chamber = SteadyState.cached_j0_p
     else:
@@ -501,7 +509,7 @@ class SteadyState():
       # solver can result in choking below the vent. Extrapolation may be
       # necessary to obtain a solution up to the last node in the mesh.
       if len(y.ravel()) == len(self.x_mesh) - 1:
-        # Extrapolate
+        # Extrapolate end-node
         p, h, y, yF = np.hstack((p, 2*p[-1] - p[-2])), \
           np.hstack((h, 2*h[-1] - h[-2])), \
           np.hstack((y, 2*y[-1] - y[-2])), \
@@ -570,9 +578,9 @@ class SteadyState():
       p_min, p_max = np.max((p_global_min, p_vent)), 1e9
       z_min, z_max = p_min, p_max
       # Define dependence of inlet volume on p_chamber
-      v_pc = lambda p_chamber: self.mixture.v_mix(p_chamber, T_chamber, yA,
-        np.clip(self.y_wv_eq(p_chamber), self.yWvInletMin, None),
-        1.0 - np.clip(self.y_wv_eq(p_chamber), self.yWvInletMin, None))
+      v_pc = lambda p_chamber: self.v_mix(p_chamber, self.T_chamber,
+          np.clip(self.y_wv_eq(p_chamber), self.yWvInletMin, None))
+      
       u0 = inlet_input_val
       # Define solve kernel that returns (x, (p, h, y), (soln, eigvals))
       solve_kernel = lambda p_chamber: self.solve_ssIVP(
@@ -642,21 +650,27 @@ class SteadyState():
     '''
     # Solve for maximum j0 / minimum p_chamber that does not choke
     
+    brent_atol = 1e-1
     if _input_type == "p":
-      z_choke = scipy.optimize.brenth(lambda z: eigmin_top(z), z_min, z_max)
+      z_choke = scipy.optimize.brentq(lambda z: eigmin_top(z),
+        z_min, z_max, xtol=brent_atol)
       z_min = z_choke
-      ''' Check vent flow state for given p_vent, and solve for solution [p(x), h(x), y(x)]. '''
+      ''' Check vent flow state for given p_vent, and solve for solution
+      [p(x), h(x), y_i(x)] where y_i are the mass fractions. '''
       if p_vent < calc_vent_p(z_choke):
         # Choked case
         print("Choked at vent.")
-        x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z_choke)
+        # Solve with one-sided precision to ensure that the last node is
+        # evaluable (i.e., choking position is >= top)
+        x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = \
+          solve_kernel(z_choke + brent_atol)
       elif p_vent > p_vent_max:
         # Inconsistent pressure (exceeds hydrostatic pressure consistent with chamber pressure)
         print("Vent pressure is too high (reverse flow required to reverse pressure gradient).")
         x, (p_soln, h_soln, y_soln, yF_soln), soln = None, (None, None, None), None
       else:
         print("Subsonic flow at vent. Shooting method for correct value of z.")
-        z = scipy.optimize.brenth(lambda z: calc_vent_p(z) - p_vent, z_min, z_max)
+        z = scipy.optimize.brentq(lambda z: calc_vent_p(z) - p_vent, z_min, z_max, xtol=brent_atol)
         print("Solution j0 found. Computing solution.")
         # Compute solution at j0
         x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
@@ -664,6 +678,7 @@ class SteadyState():
       # Number of times to double pressure while searching for choking pressure
       N_doubling = 25
 
+      # Express mass flux j0 given u
       if input_type.lower() in ("j", "j0",):        
         j0_u = lambda p: j0
       else:
@@ -671,7 +686,7 @@ class SteadyState():
         j0_u = lambda p: u / self.v_mix(p, self.T_chamber,
           np.clip(self.y_wv_eq(p), self.yWvInletMin, None))
 
-      print("Computing minimum possible pressure.")
+      print("Computing lower bound on pressure given domain length.")
       ''' Compute loose lower bound on pressure due to gravity. '''
       # Lower bound pressure
       yMax = self.yWt - self.x_sat(p_vent) * (
@@ -716,10 +731,9 @@ class SteadyState():
         if fn_x_top(b) < self.x_mesh[-1]:
           raise ValueError(f"Pressure {b} is not a continuous solution.")
 
-        abs_tol = 1e-1
         m = 0.5*(a+b)
 
-        while b - a > abs_tol:
+        while b - a > brent_atol:
           # Search criterion
           if fn_x_top(m) >= self.x_mesh[-1]: # Continuous solution found
             b = m
@@ -731,10 +745,13 @@ class SteadyState():
       pc_min = bisect_pmin(p0*2**k/2, p0*2**k)
       # Compute corresponding minimum vent pressure
       p_vent_min = self.solve_ssIVP(pc_min, j0_u(pc_min))[1][0,-1]
+      self._check = (pc_min, j0_u(pc_min))
       print(f"Minimum vent pressure is {p_vent_min}.")
       if p_vent <= p_vent_min:
         print("Choked flow.")
         z = pc_min
+        print(*self._check)
+        print(z, u0/v_pc(z))
         x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
       else:
         # Unchoked
@@ -746,7 +763,7 @@ class SteadyState():
           z_top = soln[0][-1]
           p_top = soln[1][0,-1]
           return p_top - p_vent if z_top >= self.x_mesh[-1] else -p_vent
-        z = scipy.optimize.brenth(objective, pc_min, z_max)
+        z = scipy.optimize.brentq(objective, pc_min, z_max, xtol=brent_atol)
         x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
 
     if verbose:
