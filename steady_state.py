@@ -28,7 +28,11 @@ import scipy
 import scipy.integrate
 from scipy.special import erf
 import matplotlib.pyplot as plt
-import compressible_conduit_steady.material_properties as matprops
+
+try:
+  import material_properties as matprops
+except ModuleNotFoundError:
+  import compressible_conduit_steady.material_properties as matprops
 
 # DONE: TEST: why is the limit tau_d -> Infty giving negative exsolved mass?
 #  -- too much pressure loss before it reaches the top. Events p->0, h->0 added.
@@ -467,9 +471,14 @@ class SteadyState():
     self.j0 = calc_details["j0"]
     self.p_chamber = calc_details["p"]
   
-  def __call__(self, x:np.array, output_format:str="quail") -> np.array:
+  def __call__(self, x:np.array, io_format:str="quail") -> np.array:
     '''Returns U sampled on x in quail format (default).
     Requires x to be points in interval [self.x_mesh.min(), self.x_mesh.max()].
+    Inputs:
+      x: array of points. If io_format=="quail", x is expected to have
+        three-dimensional shape (ne, n).
+      io_format: either "quail" or "phy". The latter is the native ODE solver
+        output in (p, h, y, yF) space. Here y 
     ''' 
     # Check that input x is consistent with internal length
     if x.max() > self.x_mesh.max() \
@@ -480,11 +489,11 @@ class SteadyState():
     self.x_mesh = np.union1d(x.ravel(), self.x_mesh_native)
 
     # Compute solution in requested format
-    if "phy".casefold() == output_format.casefold() \
-       or "native".casefold() == output_format.casefold():
+    if "phy".casefold() == io_format.casefold() \
+       or "native".casefold() == io_format.casefold():
       # Return solution state (p, h, y)
       return self.solve_ssIVP(self.p_chamber, self.j0)[1]
-    elif "quail".casefold() == output_format.casefold():
+    elif "quail".casefold() == io_format.casefold():
       # Solve steady state IVP with union mesh and precomputed mass flux
       p, h, y, yF = self.solve_ssIVP(self.p_chamber, self.j0)[1]
       # Correct for mesh perturbation (correct for up to one node)
@@ -530,7 +539,7 @@ class SteadyState():
           U_out[i,j,:] = vals[x[i,j,0]]
       return U_out
     else:
-      raise ValueError(f"Unknown output format string '{output_format}'.")
+      raise ValueError(f"Unknown output format string '{io_format}'.")
 
   def solve_steady_state_problem(self, p_vent:float, inlet_input_val:float,
     input_type:str="u", verbose=False):
