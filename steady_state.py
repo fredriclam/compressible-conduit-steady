@@ -78,39 +78,39 @@ class SteadyState():
     # Validate properties
     if override_properties is None:
       override_properties = {}
-    self.override_properties = override_properties
+    self.override_properties = override_properties.copy()
     ''' Set default and overridable properties'''
     # Water mass fraction (uniformly applied in conduit)
-    self.yWt            = override_properties.pop("yWt", 0.03)
-    self.yA             = override_properties.pop("yA", 1e-7)
+    self.yWt            = self.override_properties.pop("yWt", 0.03)
+    self.yA             = self.override_properties.pop("yA", 1e-7)
     # Water vapour presence slightly above zero for numerics in unsteady case
     #   Higher makes numerics more happy, even for steady-state exsolution
     #   1e-5 is 10 ppm
-    self.yWvInletMin    = override_properties.pop("yWvInletMin", 1e-5)
+    self.yWvInletMin    = self.override_properties.pop("yWvInletMin", 1e-5)
     # Crystal content (mass fraction; must be less than yl = 1.0 - ywt)
-    self.yC             = override_properties.pop("yC", 1e-7)
-    self.yCMin          = override_properties.pop("yCMin", 1e-7)
+    self.yC             = self.override_properties.pop("yC", 1e-7)
+    self.yCMin          = self.override_properties.pop("yCMin", 1e-7)
     # Inlet fragmented mass fraction
-    self.yFInlet        = override_properties.pop("yFInlet", 0.0)
+    self.yFInlet        = self.override_properties.pop("yFInlet", 0.0)
     # Critical volume fraction
-    self.crit_volfrac   = override_properties.pop("crit_volfrac", 0.7)
+    self.crit_volfrac   = self.override_properties.pop("crit_volfrac", 0.7)
     # Exsolution timescale
-    self.tau_d          = override_properties.pop("tau_d", 1.0)
+    self.tau_d          = self.override_properties.pop("tau_d", 1.0)
     # Fragmentation timescale
-    self.tau_f          = override_properties.pop("tau_f", 1.0)
+    self.tau_f          = self.override_properties.pop("tau_f", 1.0)
     # Viscosity (Pa s)
-    self.mu             = override_properties.pop("mu", 1e5)
+    self.mu             = self.override_properties.pop("mu", 1e5)
     # Conduit dimensions (m)
-    self.conduit_radius = override_properties.pop("conduit_radius", 50)
+    self.conduit_radius = self.override_properties.pop("conduit_radius", 50)
     # Chamber conditions
-    self.T_chamber      = override_properties.pop("T_chamber", 800+273.15)
+    self.T_chamber      = self.override_properties.pop("T_chamber", 800+273.15)
     # Gas properties
-    self.c_v_magma      = override_properties.pop("c_v_magma", 3e3)
-    self.rho0_magma     = override_properties.pop("rho0_magma", 2.7e3)
-    self.K_magma        = override_properties.pop("K_magma", 10e9)
-    self.p0_magma       = override_properties.pop("p0_magma", 5e6)
-    self.solubility_k   = override_properties.pop("solubility_k", 5e-6)
-    self.solubility_n   = override_properties.pop("solubility_n", 0.5)
+    self.c_v_magma      = self.override_properties.pop("c_v_magma", 3e3)
+    self.rho0_magma     = self.override_properties.pop("rho0_magma", 2.7e3)
+    self.K_magma        = self.override_properties.pop("K_magma", 10e9)
+    self.p0_magma       = self.override_properties.pop("p0_magma", 5e6)
+    self.solubility_k   = self.override_properties.pop("solubility_k", 5e-6)
+    self.solubility_n   = self.override_properties.pop("solubility_n", 0.5)
 
     # Debug option (caches AinvRHS, source term F as lambdas that cannot be
     # pickled by the default pickle module)
@@ -135,9 +135,9 @@ class SteadyState():
     if self.yFInlet > self.yL:
       raise ValueError(f"Inlet fragmented mass fraction exceeds the liquid" +
       f"melt mass fraction: inlet fragmented {self.yFInlet}, liquid melt {self.yL}.")
-    if len(override_properties.items()) > 0:
+    if len(self.override_properties.items()) > 0:
       raise ValueError(
-        f"Unused override properties:{list(override_properties.keys())}")
+        f"Unused override properties:{list(self.override_properties.keys())}")
 
     # Set depth of conduit inlet
     self.x0 = x_global.min()
@@ -149,7 +149,7 @@ class SteadyState():
     mixture.k, mixture.n = self.solubility_k, self.solubility_n
     self.mixture = mixture
 
-    # Check static cache
+    # Check static cache using hash of unpopped dict override_properties
     propshash = hash(tuple(override_properties.items()))
     inputs_array = np.array([x_global.min(), x_global.max(), 
       p_vent, inlet_input_val])
@@ -266,6 +266,9 @@ class SteadyState():
     log_mfWd = np.log(mfWd*100)
     log10_vis = -3.545 + 0.833 * log_mfWd
     log10_vis += (9601 - 2368 * log_mfWd) / (T - 195.7 - 32.25 * log_mfWd)
+    # Prevent overflowing float
+    if log10_vis > 300:
+      log10_vis = 300
     meltVisc = 10**log10_vis
     # Calculate relative viscosity due to crystals (Costa 2005).
     alpha = 0.999916
@@ -406,13 +409,19 @@ class SteadyState():
     # Set captured lambdas
     T_ph, dv_dp, v_mix, dv_dh = self.T_ph, self.dv_dp, self.v_mix, self.dv_dh
     class EventChoked():
-      def __init__(self):
+      def __init__(self, y_wv_eq=None):
         self.terminal = True
         self.sonic_tol = 1e-7
+        # Capture function p -> y_wv if provided
+        self.y_wv_eq = y_wv_eq
       def __call__(self, t, q):
         # Compute equivalent condition to conjugate pair eigenvalue == 0
         # Note that this does not check the condition u == 0 (or j0 == 0).
-        p, h, y, yF = q
+        if len(q) > 2:
+          p, h, y, yF = q
+        else:
+          p, h = q
+          y = self.y_wv_eq(p)
         T = T_ph(p, h, y)
         # dv_dp = y * (R / p * dT_dp(p, h, y) - R * T / p**2) + (1 - y) * dvm_dp(p)
         # dv_dh = y * R / p * dT_dh(p, h, y)
@@ -427,16 +436,14 @@ class SteadyState():
         self.terminal = True
         self.direction = -1.0
       def __call__(self, t, q):
-        p, h, y, yF = q
-        return p
+        return q[0] # p
 
     class ZeroEnthalpy():
       def __init__(self):
         self.terminal = True
         self.direction = -1.0
       def __call__(self, t, q):
-        p, h, y, yF = q
-        return h
+        return q[1] # h
     
     class PositivePressureGradient():
       def __init__(self, RHS):
@@ -462,10 +469,15 @@ class SteadyState():
     else: # Exsolution length scale u * tau_d -> 0
       # Exact zero flux: use reduced (equilibrium chemistry) system
       soln = scipy.integrate.solve_ivp(RHS_reduced, (self.x_mesh[0],self.x_mesh[-1]), q0[0:2], t_eval=self.x_mesh, method="Radau",
-        events=[EventChoked(), ZeroPressure(), ZeroEnthalpy(), PositivePressureGradient(RHS_reduced)])
-      # Augment output solution with y at equilibrium and yF based on frag criterion
-      # TODO: replace lazy yF fill with 0-1 values
-      soln_state = np.vstack((soln.y, self.y_wv_eq(soln.y[0,:]), np.nan*np.zeros(soln.y[0,:])))
+        events=[EventChoked(y_wv_eq=self.y_wv_eq), ZeroPressure(), ZeroEnthalpy(), PositivePressureGradient(RHS_reduced)])
+      # Augment output solution with y at equilibrium and yF based on fragmentation criterion
+      p = soln.y[0,:]
+      yWv = self.y_wv_eq(p)
+      yM = 1.0 - yWv - self.yA
+      T = self.T_ph(p, soln.y[1,:], yWv)
+      yF = yM.copy()
+      yF = np.where(self.vf_g(p, T, yWv) >= self.crit_volfrac, yM, 0.0)
+      soln_state = np.vstack((soln.y, yWv, yF))
 
     # Compute eigenvalues at the final t
     eigvals_t_final = self.eigA(*soln_state[:,-1], j0)
@@ -617,12 +629,12 @@ class SteadyState():
       mass_flux_cofactor = lambda p: 1.0
     elif input_type.lower() in ("p", "p0",):
       # Set j0 range for finding max 
-      j0_min, j0_max  = 0.0, 10e3
+      j0_min, j0_max  = 0.0, 2.7e3*100
       z_min, z_max = j0_min, j0_max
       p_chamber = inlet_input_val
       # Define solve kernel that returns (x, (p, h, y), (soln, eigvals))
       solve_kernel = lambda j0: self.solve_ssIVP(p_chamber, j0)
-      p_vent_max = calc_vent_p(j0_min)
+      p_vent_max = solve_kernel(j0_min)[1][0][-1]
       _input_type = "p"
     else:
       raise Exception('Unknown input_type (use "u", "j", "p").')
@@ -662,8 +674,9 @@ class SteadyState():
         print("Choked at vent.")
         # Solve with one-sided precision to ensure that the last node is
         # evaluable (i.e., choking position is >= top)
+        z = z_choke + brent_atol
         x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = \
-          solve_kernel(z_choke + brent_atol)
+          solve_kernel(z)
       elif p_vent > p_vent_max:
         # Inconsistent pressure (exceeds hydrostatic pressure consistent with chamber pressure)
         print("Vent pressure is too high (reverse flow required to reverse pressure gradient).")
