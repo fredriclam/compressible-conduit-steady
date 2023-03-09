@@ -763,8 +763,6 @@ class SteadyState():
       if p_vent <= p_vent_min:
         print("Choked flow.")
         z = pc_min
-        print(*self._check)
-        print(z, u0/v_pc(z))
         x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
       else:
         # Unchoked
