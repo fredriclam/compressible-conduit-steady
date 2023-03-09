@@ -180,8 +180,8 @@ class SteadyState():
   def x_sat(self, p):
     return self.mixture.x_sat(p)
 
-  def y_wv_eq(self, p):
-    return self.mixture.y_wv_eq(p, self.yWt, self.yC)
+  def y_wv_eq(self, p, yC):
+    return self.mixture.y_wv_eq(p, self.yWt, yC)
 
   def A(self, p, h, y, yf, j0):
     ''' Return coefficient matrix to ODE (A in A dq/dx = f(q)).
@@ -249,15 +249,15 @@ class SteadyState():
     '''
     # Calculate pure melt viscosity (Hess & Dingwell 1996)
     yWd = self.yWt - y
-    yL = self.yL
+    yL = 1.0 - self.yA - self.yWt - yC
     yM = 1.0 - y - self.yA
     mfWd = yWd / yL # mass concentration of dissolved water
     log_mfWd = np.log(mfWd*100)
     log10_vis = -3.545 + 0.833 * log_mfWd
     log10_vis += (9601 - 2368 * log_mfWd) / (T - 195.7 - 32.25 * log_mfWd)
     # Prevent overflowing float
-    if log10_vis > 300:
-      log10_vis = 300
+    if log10_vis > 150:
+      log10_vis = 150
     meltVisc = 10**log10_vis
     # Calculate relative viscosity due to crystals (Costa 2005).
     alpha = 0.999916
@@ -292,7 +292,7 @@ class SteadyState():
       self.tau_f, self.conduit_radius, self.T_chamber
     yFInlet = self.yFInlet
     # Compute auxiliary inlet conditions
-    yWvInlet = np.clip(self.y_wv_eq(p_chamber), self.yWvInletMin, None)
+    yWvInlet = np.clip(self.y_wv_eq(p_chamber, yC_fn(self.x_mesh[0])), self.yWvInletMin, None)
     h_chamber = self.mixture.h_mix(
       p_chamber, T_chamber, yA, yWvInlet, 1.0-yA-yWvInlet)
 
@@ -321,7 +321,7 @@ class SteadyState():
     # Define equivalent source for mass fraction exsolved (y, or yWv)
     target_yWd = lambda p, yC: np.clip(
       self.x_sat(p) * (1.0 - yC - yWt - yA), 0, yWt - self.yWvInletMin)
-    Y = lambda p, y: 1.0 / tau_d * ((yWt - y) - target_yWd(p))
+    Y = lambda p, y, yC: 1.0 / tau_d * ((yWt - y) - target_yWd(p, yC))
     # One-way gating
     # Y = lambda p, y: float(y > 0) * Y_unlimited(p, y) \
     #   + float(y <= 0) * np.clip(Y_unlimited(p,y), 0, None)
@@ -381,7 +381,7 @@ class SteadyState():
       # Compute z == -A^{-1} * b / u
       z = -j0**2 * self.dv_dy(p, T, y) / u * a1
       yL = 1.0 - yWt - yC - yA
-      return Y(p, y) * np.array([*z, 1/u, 0]) \
+      return Y(p, y, yC) * np.array([*z, 1/u, 0]) \
         + F_rho(p, T, y, yF, yC, 1.0/v) * np.array([*a1, 0, 0]) \
         + np.array([0, 0, 0, (yL - yF) / self.tau_f
           * float(self.vf_g(p, T, y) >= self.crit_volfrac)])
@@ -394,7 +394,7 @@ class SteadyState():
       yC = yC_fn(x)
       F = np.zeros((2,1))
       # Equilibrium water vapour
-      y = self.y_wv_eq(p)
+      y = self.y_wv_eq(p, yC)
       # Compute mixture temperature
       T = self.T_ph(p, h, y)
       v = self.v_mix(p, T, y)
@@ -411,11 +411,12 @@ class SteadyState():
     # Set captured lambdas
     T_ph, dv_dp, v_mix, dv_dh = self.T_ph, self.dv_dp, self.v_mix, self.dv_dh
     class EventChoked():
-      def __init__(self, y_wv_eq=None):
+      def __init__(self, y_wv_eq=None, yC_fn=None):
         self.terminal = True
         self.sonic_tol = 1e-7
         # Capture function p -> y_wv if provided
         self.y_wv_eq = y_wv_eq
+        self.yC_fn = yC_fn
       def __call__(self, t, q):
         # Compute equivalent condition to conjugate pair eigenvalue == 0
         # Note that this does not check the condition u == 0 (or j0 == 0).
@@ -423,7 +424,7 @@ class SteadyState():
           p, h, y, yF = q
         else:
           p, h = q
-          y = self.y_wv_eq(p)
+          y = self.y_wv_eq(p, self.yC_fn(t))
         T = T_ph(p, h, y)
         # dv_dp = y * (R / p * dT_dp(p, h, y) - R * T / p**2) + (1 - y) * dvm_dp(p)
         # dv_dh = y * R / p * dT_dh(p, h, y)
@@ -471,10 +472,10 @@ class SteadyState():
     else: # Exsolution length scale u * tau_d -> 0
       # Exact zero flux: use reduced (equilibrium chemistry) system
       soln = scipy.integrate.solve_ivp(RHS_reduced, (self.x_mesh[0],self.x_mesh[-1]), q0[0:2], t_eval=self.x_mesh, method="Radau",
-        events=[EventChoked(y_wv_eq=self.y_wv_eq), ZeroPressure(), ZeroEnthalpy(), PositivePressureGradient(RHS_reduced)])
+        events=[EventChoked(y_wv_eq=self.y_wv_eq, yC_fn=self.yC_fn), ZeroPressure(), ZeroEnthalpy(), PositivePressureGradient(RHS_reduced)])
       # Augment output solution with y at equilibrium and yF based on fragmentation criterion
       p = soln.y[0,:]
-      yWv = self.y_wv_eq(p)
+      yWv = self.y_wv_eq(p, self.yC_fn(soln.x))
       yM = 1.0 - yWv - self.yA
       T = self.T_ph(p, soln.y[1,:], yWv)
       yF = yM.copy()
