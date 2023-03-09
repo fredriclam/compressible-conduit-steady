@@ -188,7 +188,7 @@ class DeformationEnergyFn():
 
 
 class MagmaLinearizedDensity(ThermodynamicMaterial):
-  def __init__(self, c_v=3000.0, rho0=2.7e3, K=10e9, p_ref=10e6):
+  def __init__(self, c_v=3000.0, rho0=2.7e3, K=10e9, p_ref=5e6):
     self.c_v, self.rho0, self.K, self.p_ref = c_v, rho0, K, p_ref
     self.e_dfm = DeformationEnergyFn(rho0, K, p_ref, p_ref)
   
@@ -701,7 +701,7 @@ class MixtureMeltCrystalWaterAir():
     # Exsolved water properties
     self.waterEx = IdealGas(c_v=1826.6237513873475, c_p=2288.0)
     # Melt + Crystal + Dissolved water properties
-    self.magma = MagmaLinearizedDensity(c_v=3000, rho0=2700, K=10e9, p_ref=10e6)
+    self.magma = MagmaLinearizedDensity(c_v=3000, rho0=2700, K=10e9, p_ref=5e6)
     # Vector of phases
     self.phases = [self.air, self.waterEx, self.magma]
     # Solubility
