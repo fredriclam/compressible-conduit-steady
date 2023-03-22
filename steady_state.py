@@ -380,10 +380,11 @@ class SteadyState():
         + v * j0**2 * self.dv_dh(p, T, y))
       # Compute z == -A^{-1} * b / u
       z = -j0**2 * self.dv_dy(p, T, y) / u * a1
-      yL = 1.0 - yWt - yC - yA
+      # yL = 1.0 - yWt - yC - yA
+      yM = 1.0 - y - yA
       return Y(p, y) * np.array([*z, 1/u, 0]) \
         + F_rho(p, T, y, yF, 1.0/v) * np.array([*a1, 0, 0]) \
-        + np.array([0, 0, 0, (yL - yF) / self.tau_f
+        + np.array([0, 0, 0, (yM - yF) / self.tau_f
           * float(self.vf_g(p, T, y) >= self.crit_volfrac)])
     
     def RHS_reduced(x, q):
