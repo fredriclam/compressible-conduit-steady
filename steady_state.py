@@ -111,6 +111,8 @@ class SteadyState():
     self.p0_magma       = self.override_properties.pop("p0_magma", 5e6)
     self.solubility_k   = self.override_properties.pop("solubility_k", 5e-6)
     self.solubility_n   = self.override_properties.pop("solubility_n", 0.5)
+    # Whether to neglect deformation energy in magma EOS
+    self.neglect_edfm   = self.override_properties.pop("neglect_edfm", False)
 
     # Debug option (caches AinvRHS, source term F as lambdas that cannot be
     # pickled by the default pickle module)
@@ -145,7 +147,8 @@ class SteadyState():
     # Set mixture properties
     mixture = matprops.MixtureMeltCrystalWaterAir()
     mixture.magma = matprops.MagmaLinearizedDensity(c_v=self.c_v_magma,
-      rho0=self.rho0_magma, K=self.K_magma, p_ref=self.p0_magma)
+      rho0=self.rho0_magma, K=self.K_magma,
+      p_ref=self.p0_magma, neglect_edfm=self.neglect_edfm)
     mixture.k, mixture.n = self.solubility_k, self.solubility_n
     self.mixture = mixture
 
@@ -263,6 +266,8 @@ class SteadyState():
     yL = self.yL
     yM = 1.0 - y - self.yA
     mfWd = yWd / yL # mass concentration of dissolved water
+    if mfWd <= 0.0:
+      mfWd = 1e-8
     log_mfWd = np.log(mfWd*100)
     log10_vis = -3.545 + 0.833 * log_mfWd
     log10_vis += (9601 - 2368 * log_mfWd) / (T - 195.7 - 32.25 * log_mfWd)
@@ -279,6 +284,8 @@ class SteadyState():
     # Compute volume fraction of crystal at equal phasic densities
     # Using crystal volume per (melt + crystal + dissolved water) volume
     phi_ratio = (self.yC / yM) / phi_cr
+    if phi_ratio < 0.0:
+      phi_ratio = 0.0
     erf_term = erf(
       np.sqrt(np.pi) / (2 * alpha) * phi_ratio * (1 + phi_ratio**gamma))
     crysVisc = (1 + phi_ratio**delta) * ((1 - alpha * erf_term)**(-B * phi_cr))
@@ -384,7 +391,7 @@ class SteadyState():
       yM = 1.0 - y - yA
       return Y(p, y) * np.array([*z, 1/u, 0]) \
         + F_rho(p, T, y, yF, 1.0/v) * np.array([*a1, 0, 0]) \
-        + np.array([0, 0, 0, (yM - yF) / self.tau_f
+        + np.array([0, 0, 0, (yM - yF) / (u * self.tau_f)
           * float(self.vf_g(p, T, y) >= self.crit_volfrac)])
     
     def RHS_reduced(x, q):
@@ -663,7 +670,7 @@ class SteadyState():
     '''
     # Solve for maximum j0 / minimum p_chamber that does not choke
     
-    brent_atol = 1e-1
+    brent_atol = 1e-5
     if _input_type == "p":
       z_choke = scipy.optimize.brentq(lambda z: eigmin_top(z),
         z_min, z_max, xtol=brent_atol)
@@ -675,7 +682,7 @@ class SteadyState():
         print("Choked at vent.")
         # Solve with one-sided precision to ensure that the last node is
         # evaluable (i.e., choking position is >= top)
-        z = z_choke + brent_atol
+        z = z_choke - 2*brent_atol
         x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = \
           solve_kernel(z)
       elif p_vent > p_vent_max:
@@ -690,7 +697,7 @@ class SteadyState():
         x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
     elif _input_type == "u":
       # Number of times to double pressure while searching for choking pressure
-      N_doubling = 25
+      N_doubling = 14
 
       # Express mass flux j0 given u
       if input_type.lower() in ("j", "j0",):        
@@ -712,28 +719,56 @@ class SteadyState():
       p_minbound = p_vent + self.conduit_length * 9.8 /  vMax
 
       ''' Find lowest-pressure continuous solution '''
-      p0 = p_minbound
-      for k in range(N_doubling):
-        # Compute IVP solution
-        
-        p_chamber = p0*2**k
-        j0 = j0_u(p_chamber)
-        _out = self.solve_ssIVP(p0*2**k, j0)
-        p_top = _out[1][0,-1]
-        x_top = _out[0][-1]
-        # ''' Top pressure and pressure grad check'''
-        # q_top = _out[1][:,-1]
-        # dqdx = np.linalg.solve(self.A(*q_top, j0), self.F(q_top)).flatten()
-        # dpdx = dqdx[0]
-        # # Tolerable distance-to-zero-pressure
-        # p_min = 0.001e6 # 1 mbar
-        # dx_min = 1.0    # 1 m until zero pressure
-        # is_reached_vacuum = p_top < p_min or p_top/np.abs(dpdx) < dx_min
-        # Search criterion
-        if x_top >= self.x_mesh[-1]:
-          break
-      else:
-        raise Exception("Could not bracket lower pressure limit.")
+      _use_legacy_bound_method = False
+      if _use_legacy_bound_method:
+        # Arbitrarily set minimum pressure
+        # approx_pseudogas_scale_height = (self.yWt * self.mixture.waterEx.R
+        #   * self.T_chamber) / 9.8
+        # p_guess = p_vent * np.exp(self.conduit_length /
+        #   approx_pseudogas_scale_height)
+        # p0 = 10*p_guess
+        p0 = p_minbound
+        k_last = None
+        for k in range(N_doubling):
+          # Compute IVP solution
+          
+          p_chamber = p0*2**k
+          j0 = j0_u(p_chamber)
+          _out = self.solve_ssIVP(p0*2**k, j0)
+          p_top = _out[1][0,-1]
+          x_top = _out[0][-1]
+          # ''' Top pressure and pressure grad check'''
+          # q_top = _out[1][:,-1]
+          # dqdx = np.linalg.solve(self.A(*q_top, j0), self.F(q_top)).flatten()
+          # dpdx = dqdx[0]
+          # # Tolerable distance-to-zero-pressure
+          # p_min = 0.001e6 # 1 mbar
+          # dx_min = 1.0    # 1 m until zero pressure
+          # is_reached_vacuum = p_top < p_min or p_top/np.abs(dpdx) < dx_min
+          
+          # Search criterion
+          if x_top >= self.x_mesh[-1]:
+            # Register k
+            k_last = k
+            # break
+        if k_last is None:
+          raise Exception("Could not bracket lower pressure limit.")
+
+      ''' Sample function p_vent(p_chamber) to find highest-pressure choke. '''
+      # Companion function: p_vent(p_chamber)
+      search_p = np.linspace(p_minbound, 300e6, 50)
+      def penalized_top_pressure(p_chamber):
+        soln = self.solve_ssIVP(p_chamber, j0_u(p_chamber))
+        if soln[0][-1] < self.x_mesh[-1]:
+          return -1
+        return soln[1][0, -1]
+      tentatives_p_vent = [penalized_top_pressure(p) for p in search_p] 
+      # (debug) plot p_chamber to p_vent mapping
+      # plt.semilogy(search_p, tentatives_p_vent)
+      # plt.xlabel("Inlet pressure (Pa)")
+      # plt.ylabel("Vent pressure (Pa)")
+      _i = len(tentatives_p_vent) - np.argmax(
+        np.array(tentatives_p_vent[::-1]) < 0)
 
       def bisect_pmin(a,b):
         ''' Manual bisection for minimum pressure. '''
@@ -755,8 +790,11 @@ class SteadyState():
             a = m
           m = 0.5*(a+b)
         return b # Continuous solution
+
       # Compute minimum possible chamber pressure
-      pc_min = bisect_pmin(p0*2**k/2, p0*2**k)
+      # pc_min = bisect_pmin(p0*2**k/2, p0*2**k)
+      pc_min = bisect_pmin(search_p[_i-1], search_p[_i])
+
       # Compute corresponding minimum vent pressure
       p_vent_min = self.solve_ssIVP(pc_min, j0_u(pc_min))[1][0,-1]
       self._check = (pc_min, j0_u(pc_min))

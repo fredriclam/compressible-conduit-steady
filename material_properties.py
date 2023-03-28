@@ -188,8 +188,16 @@ class DeformationEnergyFn():
 
 
 class MagmaLinearizedDensity(ThermodynamicMaterial):
-  def __init__(self, c_v=3000.0, rho0=2.7e3, K=10e9, p_ref=5e6):
+  def __init__(self, c_v:float=3000.0, rho0:float=2.7e3, K:float=10e9,
+      p_ref:float=5e6, neglect_edfm:bool=False):
+    '''
+    Inputs:
+    neglect_edfm (optional): whether to neglect deformation energy in
+      calculations for e_pT and h_pT calculations. Neglecting deformation
+      energy removes pressure from the energy dependence. The internal e_dfm
+      object is still needed to compute deformation properties (EOS). '''
     self.c_v, self.rho0, self.K, self.p_ref = c_v, rho0, K, p_ref
+    self.neglect_edfm = neglect_edfm
     self.e_dfm = DeformationEnergyFn(rho0, K, p_ref, p_ref)
   
   @property
@@ -212,6 +220,8 @@ class MagmaLinearizedDensity(ThermodynamicMaterial):
     self._c_p = val
   
   def e_pT(self, p ,T):
+    if self.neglect_edfm:
+      return self.c_v * T
     return self.c_v * T + self.e_dfm(p)
 
   def h_pT(self, p, T):
