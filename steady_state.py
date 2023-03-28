@@ -152,6 +152,9 @@ class SteadyState():
     mixture.k, mixture.n = self.solubility_k, self.solubility_n
     self.mixture = mixture
 
+    # Set tolerance for numerical solve
+    self.brent_atol = 1e-5
+
     # Check static cache using hash of unpopped dict override_properties
     propshash = hash(tuple(override_properties.items()))
     inputs_array = np.array([x_global.min(), x_global.max(), 
@@ -293,7 +296,7 @@ class SteadyState():
     viscosity = meltVisc * crysVisc
     return viscosity
 
-  def solve_ssIVP(self, p_chamber, j0) -> tuple:
+  def solve_ssIVP(self, p_chamber, j0, dense_output=False) -> tuple:
     ''' Solves initial value problem for (p,h,y)(x), given fully specified
     chamber (boundary) state.
     Returns:
@@ -405,8 +408,8 @@ class SteadyState():
       T = self.T_ph(p, h, y)
       v = self.v_mix(p, T, y)
       # Compute fragmented mass fraction
-      yL = 1.0 - yWt - yC - yA
-      yF = yL if self.vf_g(p, T, y) >= self.crit_volfrac else 0
+      yM = 1.0 - y - yA
+      yF = yM if self.vf_g(p, T, y) >= self.crit_volfrac else 0
       # Compute source vector with idempotent A^{-1} = A premultiplied
       F[0] = 1
       F[1] = v
@@ -470,14 +473,24 @@ class SteadyState():
         [EventChoked(), ZeroPressure(), ZeroEnthalpy(), PositivePressureGradient(AinvRHS)])
     # Call ODE solver
     if j0 > 0:
-      soln = scipy.integrate.solve_ivp(AinvRHS, (self.x_mesh[0],self.x_mesh[-1]), q0, t_eval=self.x_mesh, method="Radau",
-        events=[EventChoked(), ZeroPressure(), ZeroEnthalpy(), PositivePressureGradient(AinvRHS)])
+      soln = scipy.integrate.solve_ivp(AinvRHS,
+        (self.x_mesh[0],self.x_mesh[-1]),
+        q0,
+        # t_eval=self.x_mesh,
+        method="Radau", dense_output=dense_output,
+        events=[EventChoked(), ZeroPressure(),
+          ZeroEnthalpy(), PositivePressureGradient(AinvRHS)])
       # Output solution
       soln_state = soln.y
     else: # Exsolution length scale u * tau_d -> 0
       # Exact zero flux: use reduced (equilibrium chemistry) system
-      soln = scipy.integrate.solve_ivp(RHS_reduced, (self.x_mesh[0],self.x_mesh[-1]), q0[0:2], t_eval=self.x_mesh, method="Radau",
-        events=[EventChoked(y_wv_eq=self.y_wv_eq), ZeroPressure(), ZeroEnthalpy(), PositivePressureGradient(RHS_reduced)])
+      soln = scipy.integrate.solve_ivp(RHS_reduced,
+        (self.x_mesh[0],self.x_mesh[-1]),
+        q0[0:2],
+        t_eval=self.x_mesh,
+        method="Radau", dense_output=dense_output,
+        events=[EventChoked(y_wv_eq=self.y_wv_eq), ZeroPressure(),
+          ZeroEnthalpy(), PositivePressureGradient(RHS_reduced)])
       # Augment output solution with y at equilibrium and yF based on fragmentation criterion
       p = soln.y[0,:]
       yWv = self.y_wv_eq(p)
@@ -512,33 +525,27 @@ class SteadyState():
     if x.max() > self.x_mesh.max() \
       or x.min() < self.x_mesh.min():
       raise ValueError("Requested values at x not in initial global mesh.")
-    # Save union of x, x_mesh_native as output mesh. This is required if
-    # sampling over a subregion of the entire conduit domain.
-    self.x_mesh = np.union1d(x.ravel(), self.x_mesh_native)
+
+    # Solve steady state IVP with native mesh and precomputed mass flux
+    soln = self.solve_ssIVP(self.p_chamber, self.j0, dense_output=True)
+    # Extract interpolator from scipy.integrate.solve_ivp
+    dense_soln = soln[2][0].sol
+    # Evaluate solution using interpolator
+    Q = dense_soln(np.unique(x))
+    # Extrapolate out-of-bounds values using nearest value
+    last_legit_index = len(np.unique(x)) \
+      - np.argmax(np.unique(x)[::-1] <= soln[0].max()) - 1
+    Q[:, np.unique(x) > soln[0].max()] = \
+      Q[:, last_legit_index:last_legit_index+1]
 
     # Compute solution in requested format
     if "phy".casefold() == io_format.casefold() \
        or "native".casefold() == io_format.casefold():
       # Return solution state (p, h, y)
-      return self.solve_ssIVP(self.p_chamber, self.j0)[1]
+       # Evaluate solution using interpolator
+      return Q
     elif "quail".casefold() == io_format.casefold():
-      # Solve steady state IVP with union mesh and precomputed mass flux
-      p, h, y, yF = self.solve_ssIVP(self.p_chamber, self.j0)[1]
-      # Correct for mesh perturbation (correct for up to one node)
-      # If the flow is close to vent-choked, numerical perturbation to the IVP
-      # solver can result in choking below the vent. Extrapolation may be
-      # necessary to obtain a solution up to the last node in the mesh.
-      if len(y.ravel()) == len(self.x_mesh) - 1:
-        # Extrapolate end-node
-        p, h, y, yF = np.hstack((p, 2*p[-1] - p[-2])), \
-          np.hstack((h, 2*h[-1] - h[-2])), \
-          np.hstack((y, 2*y[-1] - y[-2])), \
-          np.hstack((yF, 2*y[-1] - yF[-2]))
-      
-      ''' Construct conservative state vector in union mesh.
-      The variable U stores the solution in the union of the sample mesh x and
-      the domain representation self.x_mesh_native.
-      '''
+      p, h, y, yF = Q
       # Mass fraction correction
       y = np.where(y < 0, self.yWvInletMin, y)
       # Crystallinity correction
@@ -547,7 +554,7 @@ class SteadyState():
       T = self.T_ph(p, h, y)
       v = self.v_mix(p, T, y)
       # Load and return conservative state vector
-      U = np.zeros((*self.x_mesh.shape,8))
+      U = np.zeros((*np.unique(x).shape,8))
       U[...,0] = self.yA / v
       U[...,1] = y / v
       U[...,2] = (1.0 - y - self.yA) / v
@@ -559,7 +566,7 @@ class SteadyState():
 
       ''' Extract only values of U that correspond to query locations x. '''
       # Define associative map from value of x to state vector U
-      vals = {x: U[i,:] for i, x in enumerate(self.x_mesh)}
+      vals = {x: U[i,:] for i, x in enumerate(np.unique(x))}
       U_out = np.zeros((*x.shape[:2],8))
       # Map sample locations to state values U
       for i in range(U_out.shape[0]):
@@ -670,7 +677,7 @@ class SteadyState():
     '''
     # Solve for maximum j0 / minimum p_chamber that does not choke
     
-    brent_atol = 1e-5
+    brent_atol = self.brent_atol
     if _input_type == "p":
       z_choke = scipy.optimize.brentq(lambda z: eigmin_top(z),
         z_min, z_max, xtol=brent_atol)
@@ -681,7 +688,8 @@ class SteadyState():
         # Choked case
         print("Choked at vent.")
         # Solve with one-sided precision to ensure that the last node is
-        # evaluable (i.e., choking position is >= top)
+        # evaluable (i.e., choking position is >= top). This is not a guarantee
+        # when solution is requested 
         z = z_choke - 2*brent_atol
         x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = \
           solve_kernel(z)
