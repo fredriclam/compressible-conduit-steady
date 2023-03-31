@@ -258,7 +258,7 @@ class SteadyState():
     frag_factor = np.clip(1.0 - yF/yM, 0.0, 1.0)
     return -8.0*mu/self.conduit_radius**2 * u * frag_factor
 
-  def F_fric_viscosity_model(self, T, y, yF) -> float:
+  def F_fric_viscosity_model(self, T, y, yF):
     ''' Calculates the viscosity as a function of dissolved
     water and crystal content (assumes crystal phase is incompressible)/
     Does not take into account fragmented vs. not fragmented (avoiding
@@ -269,14 +269,12 @@ class SteadyState():
     yL = self.yL
     yM = 1.0 - y - self.yA
     mfWd = yWd / yL # mass concentration of dissolved water
-    if mfWd <= 0.0:
-      mfWd = 1e-8
+    mfWd = np.where(mfWd <= 0.0, 1e-8, mfWd)
     log_mfWd = np.log(mfWd*100)
     log10_vis = -3.545 + 0.833 * log_mfWd
     log10_vis += (9601 - 2368 * log_mfWd) / (T - 195.7 - 32.25 * log_mfWd)
     # Prevent overflowing float
-    if log10_vis > 300:
-      log10_vis = 300
+    log10_vis = np.where(log10_vis > 300, 300, log10_vis)
     meltVisc = 10**log10_vis
     # Calculate relative viscosity due to crystals (Costa 2005).
     alpha = 0.999916
@@ -286,9 +284,7 @@ class SteadyState():
     B = 2.5
     # Compute volume fraction of crystal at equal phasic densities
     # Using crystal volume per (melt + crystal + dissolved water) volume
-    phi_ratio = (self.yC / yM) / phi_cr
-    if phi_ratio < 0.0:
-      phi_ratio = 0.0
+    phi_ratio = np.clip((self.yC / yM) / phi_cr, 0.0, None)
     erf_term = erf(
       np.sqrt(np.pi) / (2 * alpha) * phi_ratio * (1 + phi_ratio**gamma))
     crysVisc = (1 + phi_ratio**delta) * ((1 - alpha * erf_term)**(-B * phi_cr))
@@ -368,13 +364,14 @@ class SteadyState():
       # Solve for RHS ode
       return np.linalg.solve(self.A(*q, j0), F(q)).flatten()
 
-    def AinvRHS(x, q):
+    def AinvRHS(x, q, vectorized=False):
       ''' Precomputed A^{-1} f for speed.
       Uses block triangular inverse of
         [A b]^{-1}  = [A^{-1}  z ]
         [  u]         [       1/u]
       applied to sparse RHS vector F.
-      Use this instead of RHS for speed.
+      Use this instead of RHS for speed. Supports vectorized input if
+        vectorized=True
       '''
       # Unpack
       p, h, y, yF = q
@@ -386,16 +383,28 @@ class SteadyState():
       v     = self.v_mix(p, T, y) 
       u     = j0 * v
       # Compute first column of A^{-1}:(2,1)
-      a1 = np.array([1, v]) / (1+j0**2 * self.dv_dp(p, T, y) \
-        + v * j0**2 * self.dv_dh(p, T, y))
+      a1 = np.vstack((np.ones_like(v), v)) / (1.0+j0*j0 * self.dv_dp(p, T, y) \
+        + v * j0*j0 * self.dv_dh(p, T, y))
       # Compute z == -A^{-1} * b / u
-      z = -j0**2 * self.dv_dy(p, T, y) / u * a1
+      z = -j0*j0 * self.dv_dy(p, T, y) / u * a1
       # yL = 1.0 - yWt - yC - yA
       yM = 1.0 - y - yA
-      return Y(p, y) * np.array([*z, 1/u, 0]) \
-        + F_rho(p, T, y, yF, 1.0/v) * np.array([*a1, 0, 0]) \
-        + np.array([0, 0, 0, (yM - yF) / (u * self.tau_f)
-          * float(self.vf_g(p, T, y) >= self.crit_volfrac)])
+
+      vec_length = p.shape[-1] if len(p.shape) > 0 else 1
+      # return Y(p, y) * np.array([*z, 1/u, 0]) \
+      #   + F_rho(p, T, y, yF, 1.0/v) * np.array([*a1, 0, 0]) \
+      #   + np.array([0, 0, 0, (yM - yF) / (u * self.tau_f)
+      #     * float(self.vf_g(p, T, y) >= self.crit_volfrac)])
+      out = Y(p,y) * np.vstack((z,  1.0/u, np.zeros_like(u))) \
+        + F_rho(p, T, y, yF, 1.0/v) \
+          * np.vstack((a1, np.zeros((2, vec_length)))) \
+        + np.vstack([np.zeros((3, vec_length)),
+          (yM - yF) / (u * self.tau_f)
+            * np.array(self.vf_g(p, T, y) >= self.crit_volfrac).astype(float)])
+      if not vectorized:
+        # Return flattened version
+        return out.squeeze(axis=-1)
+      return out
     
     def RHS_reduced(x, q):
       ''' Reduced-size system for j0 == 0 case. (2x1 instead of 4x1).
