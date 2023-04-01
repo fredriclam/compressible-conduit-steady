@@ -854,6 +854,60 @@ class SteadyState():
     else:
       return x, (p_soln, h_soln, y_soln, yF_soln)
 
+def parallel_foward_map(f:SteadyState, mg_p, mg_j0, num_processes=None):
+  ''' Runs the forward ODE solution map in parallel.
+  Specifying num_processes is highly preferred (otherwise the number of physical
+  cores is checked; this may not work suitably for cluster usage.)
+  '''
+  import multiprocessing as mp
+
+  if num_processes is None:
+    # Estimate number of CPUs available
+    try:
+      from psutil import cpu_count
+      # Saturate physical CPU count
+      num_processes = cpu_count(logical=False)
+    except ModuleNotFoundError:
+      # Set default CPU count
+      num_processes = 4
+    
+  # Define target function and argument list
+  _args = list(zip(mg_p.ravel(), mg_j0.ravel()))
+  with mp.Pool(num_processes) as pool:
+    results = [r for r in pool.starmap(f.solve_ssIVP, _args, chunksize=4)]
+
+  # Unpack results
+  mg_x_top = np.zeros_like(mg_p)
+  mg_p_top = np.zeros_like(mg_p)
+  mg_T_in = np.zeros_like(mg_p)
+  mg_T_top = np.zeros_like(mg_p)
+  mg_v_in = np.zeros_like(mg_p)
+  mg_v_top = np.zeros_like(mg_p)
+  mg_M_top = np.zeros_like(mg_p)
+  # Iteratively extract results
+  for i in range(mg_p.ravel().size):
+    _z = results[i] 
+    mg_x_top.ravel()[i] = _z[0][-1]
+    mg_p_top.ravel()[i] = _z[1][0,-1]
+    T_in = f.T_ph(_z[1][0,0], _z[1][1,0], _z[1][2,0])
+    mg_T_in.ravel()[i] = T_in
+    T_top = f.T_ph(_z[1][0,-1], _z[1][1,-1], _z[1][2,-1])
+    mg_T_top.ravel()[i] = T_top
+    mg_v_in.ravel()[i] = mg_j0.ravel()[i] * f.v_mix(_z[1][0,0], T_in, _z[1][2,0])
+    mg_v_top.ravel()[i] = mg_j0.ravel()[i] * f.v_mix(_z[1][0,-1], T_top, _z[1][2,-1])
+    mg_M_top.ravel()[i] = mg_v_top.ravel()[i] / f.mixture.sound_speed(
+      _z[1][0,-1], T_top, f.yA, _z[1][2,-1], 1.0 - f.yA - _z[1][2,-1])
+
+  return {
+    "x_top": mg_x_top,
+    "p_top": mg_p_top,
+    "T_in": mg_T_in,
+    "T_top": mg_T_top,
+    "vel_in": mg_v_in, 
+    "vel_top": mg_v_top, 
+    "M_top": mg_M_top,
+  }
+
 
 if __name__ == "__main__":
   ''' Perform unit test '''
