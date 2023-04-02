@@ -854,7 +854,7 @@ class SteadyState():
     else:
       return x, (p_soln, h_soln, y_soln, yF_soln)
 
-def parallel_foward_map(f:SteadyState, mg_p, mg_j0, num_processes=None):
+def parallel_forward_map(f:SteadyState, mg_p, mg_j0, num_processes=None):
   ''' Runs the forward ODE solution map in parallel.
   Specifying num_processes is highly preferred (otherwise the number of physical
   cores is checked; this may not work suitably for cluster usage.)
@@ -906,6 +906,7 @@ def parallel_foward_map(f:SteadyState, mg_p, mg_j0, num_processes=None):
     "vel_in": mg_v_in, 
     "vel_top": mg_v_top, 
     "M_top": mg_M_top,
+    "results": results,
   }
 
 
