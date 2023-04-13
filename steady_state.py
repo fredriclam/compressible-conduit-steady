@@ -486,7 +486,7 @@ class SteadyState():
         (self.x_mesh[0],self.x_mesh[-1]),
         q0,
         # t_eval=self.x_mesh,
-        method="Radau", dense_output=dense_output,
+        method="Radau", dense_output=dense_output, max_step=5.0,
         events=[EventChoked(), ZeroPressure(),
           ZeroEnthalpy(), PositivePressureGradient(AinvRHS)])
       # Output solution
@@ -497,7 +497,7 @@ class SteadyState():
         (self.x_mesh[0],self.x_mesh[-1]),
         q0[0:2],
         t_eval=self.x_mesh,
-        method="Radau", dense_output=dense_output,
+        method="Radau", dense_output=dense_output, max_step=5.0,
         events=[EventChoked(y_wv_eq=self.y_wv_eq), ZeroPressure(),
           ZeroEnthalpy(), PositivePressureGradient(RHS_reduced)])
       # Augment output solution with y at equilibrium and yF based on fragmentation criterion
@@ -690,12 +690,19 @@ class SteadyState():
     if _input_type == "p":
       z_choke = scipy.optimize.brentq(lambda z: eigmin_top(z),
         z_min, z_max, xtol=brent_atol)
+      # Bias to get slightly unchoked within tolerance
+      print(f"{calc_vent_p(z_choke-2*brent_atol)} and {calc_vent_p(z_choke+2*brent_atol)}")
+      print(f"{eigmin_top(z_choke-2*brent_atol)} and {eigmin_top(z_choke+2*brent_atol)}")
+
       z_min = z_choke
       ''' Check vent flow state for given p_vent, and solve for solution
       [p(x), h(x), y_i(x)] where y_i are the mass fractions. '''
-      if p_vent < calc_vent_p(z_choke):
+      p_choke = calc_vent_p(z_choke)
+      print(f"Computed choking mass flux: {z_choke}; " + 
+            f"choking pressure: {p_choke}.")
+      if p_vent < p_choke:
         # Choked case
-        print("Choked at vent.")
+        print(f"Choked at vent.")
         # Solve with one-sided precision to ensure that the last node is
         # evaluable (i.e., choking position is >= top). This is not a guarantee
         # when solution is requested 
