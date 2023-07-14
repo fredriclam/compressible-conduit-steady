@@ -113,6 +113,7 @@ class SteadyState():
     self.solubility_n   = self.override_properties.pop("solubility_n", 0.5)
     # Whether to neglect deformation energy in magma EOS
     self.neglect_edfm   = self.override_properties.pop("neglect_edfm", False)
+    self.fragsmooth_scale     = self.override_properties.pop("fragsmooth_scale", 0.01)
 
     # Debug option (caches AinvRHS, source term F as lambdas that cannot be
     # pickled by the default pickle module)
@@ -291,6 +292,234 @@ class SteadyState():
     
     viscosity = meltVisc * crysVisc
     return viscosity
+  
+  def source_y(self, p, y):
+    ''' Source term for mass fraction exsolved (y aka yW or yWv) '''
+    # Set target mass fraction 
+    target_yWd = np.clip(
+      self.x_sat(p) * (1.0 - self.yC - self.yWt - self.yA),
+      0,
+      self.yWt - self.yWvInletMin)
+    return 1.0 / self.tau_d * ((self.yWt - y) - target_yWd)
+
+  def choking_ratio(self, p, h, y, j0):
+    ''' Compute steady-state analog to u^2 / c^2. Flow is choked
+    when the output is equal to 1.'''
+    T = self.T_ph(p, h, y)
+    return -j0**2 * (self.dv_dp(p, T, y) 
+          + self.v_mix(p, T, y) * self.dv_dh(p, T, y))
+
+  def solve_pcoord_system(self, p_chamber, j0):
+    ''' Solves initial value problem as (h, y, yf)(p), and then solves the
+    pressure gradient equation for dp/dx = F(p, h, y, yf) for the mapping p(x). '''
+    yA = self.yA
+    # Compute auxiliary inlet conditions
+    yWvInlet = np.clip(self.y_wv_eq(p_chamber), self.yWvInletMin, None)
+    h_chamber = self.mixture.h_mix(
+      p_chamber, self.T_chamber, self.yA, yWvInlet, 1.0 - self.yA - yWvInlet)
+    # Set chamber (inlet) condition (p, h, y) with y = y_eq at pressure
+    q0 = np.array([h_chamber, yWvInlet, self.yFInlet])
+
+    ''' Define momentum source (using captured parameters). '''
+    # Define gravity momentum source
+    F_grav = lambda rho: rho * (-9.8)
+    # Define ODE momentum source term sum in terms of density rho
+    F_rho = lambda p, T, y, yF, rho: F_grav(rho) \
+      + self.F_fric(p, T, y, yF, rho, j0/rho)
+
+    def RHS(p, q, vectorized=False):
+      ''' Right-hand side of the primitive variable vector equation 
+      with state q == [h, y, yF]. The structure of the mass matrix is
+            [B   b]   [_ _ _ 0]                      [_ _ _ 0]
+        A = [   uI] = [_ _ 0 0] and inverse sparsity [_ _ _ 0] .
+                      [0 0 _ 0]                      [0 0 _ 0]
+                      [0 0 0 _]                      [0 0 0 _]
+      Note that
+        dv_dp = y * (R / p * dT_dp(p, h, y) - R * T / p**2) + (1 - y) * dvm_dp(p)
+        dv_dh = y * R / p * dT_dh(p, h, y)
+        dv_dy = (v_wv(p, T) - v_m(p)) + y * R / p * dT_dy(p, T, y)'''
+      p = np.asarray(p)
+      # Unpack
+      h, y, yF = q
+      # Compute dependents
+      T     = self.T_ph(p, h, y) 
+      v     = self.v_mix(p, T, y) 
+      u     = j0 * v
+      # Compute first column of B^{-1} with shape (2,1) and value [-1, -v] / det
+      a1 = np.vstack((np.ones_like(v), v)) / (1.0 + j0 * j0 * self.dv_dp(p, T, y) \
+        + v * j0 * j0 * self.dv_dh(p, T, y))
+      # Compute z == -B^{-1} * b / u with shape (2,1)
+      z = -j0 * j0 * self.dv_dy(p, T, y) / u * a1
+      yL = 1.0 - self.yWt - self.yC - self.yA
+      yM = 1.0 - y - self.yA
+
+      vec_length = p.shape[-1] if len(p.shape) > 0 else 1
+      # Compute source contribution of exsolution term with mode [[z], 1/u, 0]
+      o1 = self.source_y(p,y) * np.vstack((z,  1.0/u, np.zeros_like(u))) \
+      # Compute momentum contribution with mode [[a1], 0, 0]
+      o2 = F_rho(p, T, y, yF, 1.0/v) * np.vstack((a1, np.zeros((2, vec_length))))
+      # Compute fragmentation source contribution with mode [0, 0, 0, 1]
+      o3 = np.vstack([np.zeros((3, vec_length)),
+           self.frag_source(p, T, y, yF, u * self.tau_f)])
+      out = o1 + o2 + o3
+
+      # Transform independent coordinates from x to p
+      out = out[1:,...] / out[0:1,...]
+      if not vectorized:
+        # Return flattened version
+        return out.squeeze(axis=-1)
+      return out
+    
+    def RHS_xp(p, q):
+      ''' Second ODE set for translating pressure to position. '''
+      # Unpack
+      p = np.asarray(p)
+      h, y, yF = q
+      # Compute dependents
+      T     = self.T_ph(p, h, y) 
+      v     = self.v_mix(p, T, y)
+      u     = j0 * v
+      # Compute contributions to dp/dx equation from A^{-1} positions (0,0) and (0,2)
+      #   A^{-1} has zero at entry (0,3) and source vector has zero at entry (1,).
+      neg_det = (1.0 + j0 * j0 * self.dv_dp(p, T, y)
+        + v * j0 * j0 * self.dv_dh(p, T, y))
+      drag_dpdx = F_rho(p, T, y, yF, 1.0/v) / neg_det
+      source_dpdx = self.source_y(p,y) * (
+        -j0 * j0 * self.dv_dy(p, T, y) / u / neg_det)
+      dxdp = 1.0 / (drag_dpdx + source_dpdx)
+      return dxdp
+    
+    def RHS_reduced(p, h):
+      ''' Reduced-size system for j0 == 0 case. (1x1 instead of 3x1).
+      Length scale of exsolution and fragmentation -> 0. The reduction is
+      simply the energy equation written as
+         dh = v dp. '''
+      F = np.zeros((1,1))
+      # Equilibrium water vapour
+      y_eq = self.y_wv_eq(p)
+      # Compute mixture temperature
+      T = self.T_ph(p, h, y_eq)
+      v = self.v_mix(p, T, y_eq)
+      # Compute fragmented mass fraction
+      yM = 1.0 - y - yA
+      yF = yM if self.vf_g(p, T, y) >= self.crit_volfrac else 0
+      # Compute source vector with idempotent A^{-1} = A premultiplied
+      F[0] = v
+      return F.flatten()
+
+    def RHS_xp_reduced(p, h):
+      ''' Second ODE set for translating pressure to position. '''
+      # Unpack
+      p = np.asarray(p)
+      # Equilibrium water vapour
+      y_eq = self.y_wv_eq(p)
+      # Compute mixture temperature
+      T = self.T_ph(p, h, y_eq)
+      v = self.v_mix(p, T, y_eq)
+      # Compute fragmented mass fraction
+      yM = 1.0 - y - yA
+      yF = yM if self.vf_g(p, T, y) >= self.crit_volfrac else 0
+      return 1.0 / F_rho(p, T, y, yF, 1.0/v)
+
+    class EventChokedPCoord():
+      def __init__(self, choking_ratio:callable, y_wv_eq=None):
+        self.terminal = True
+        self.sonic_tol = 0.0
+        # Capture function p -> y_wv if provided
+        self.y_wv_eq = y_wv_eq
+        self.choking_ratio = choking_ratio
+      def __call__(self, p, q):
+        # Compute equivalent condition to conjugate pair eigenvalue == 0
+        # Note that this does not check the condition u == 0 (or j0 == 0).
+        if len(q) > 2:
+          h, y, yF = q
+        else:
+          h = q
+          y = self.y_wv_eq(p)
+        # dv_dp = y * (R / p * dT_dp(p, h, y) - R * T / p**2) + (1 - y) * dvm_dp(p)
+        # dv_dh = y * R / p * dT_dh(p, h, y)
+        # Return M^2 == 1 - sonic_tol using captured j0
+        return 1.0 - self.sonic_tol - self.choking_ratio(p, h, y, j0)
+
+    p_min = 1e-5
+
+    # Call ODE solver
+    if j0 > 0:
+      soln_hyy = scipy.integrate.solve_ivp(RHS,
+        (p_chamber, p_min),
+        q0,
+        # t_eval=self.x_mesh,
+        method="Radau", dense_output=True,
+        events=[EventChokedPCoord(self.choking_ratio)])
+      soln_dense_hyy = soln_hyy.sol
+      p = soln_hyy.t
+      # Compute x
+      soln_x = scipy.integrate.solve_ivp(lambda t, y: [RHS_xp(t, soln_dense_hyy(t))],
+        (p_chamber, p[-1]),
+        [self.x_mesh[0]],
+        method="Radau", dense_output=True)
+    else:
+      # Exact zero flux: use reduced (equilibrium chemistry, fragmentation) system
+      soln_hyy = scipy.integrate.solve_ivp(RHS_reduced,
+        (p_chamber, p_min),
+        q0[0:1],
+        # t_eval=self.x_mesh,
+        method="Radau", dense_output=True,
+        events=[EventChokedPCoord(self.choking_ratio, y_wv_eq=self.y_wv_eq)])
+      # Augment output solution with y at equilibrium and yF based on fragmentation criterion
+      p = soln_hyy.t
+      # Wrap dense solution with equilibrium mass fraction values
+      def soln_dense_hyy(t):
+        # Interpret independent variable as p
+        p = t
+        yWv = self.y_wv_eq(p)
+        yM = 1.0 - yWv - self.yA
+        T = self.T_ph(p, soln_hyy.y[0,:], yWv)
+        yF = np.where(self.vf_g(p, T, yWv) >= self.crit_volfrac, yM, 0.0)
+        return np.vstack([p, soln_hyy.sol(t), yWv, yF])
+      # Compute x
+      soln_x = scipy.integrate.solve_ivp(lambda t, y: [RHS_xp(t, soln_dense_hyy(t))],
+        (p_chamber, p[-1]),
+        [self.x_mesh[0]],
+        method="Radau", dense_output=True)
+
+    return {
+      "range(p)": (soln_hyy.t.min(), soln_hyy.t.max()),
+      "x(p)": soln_x.sol,
+      "hyy(p)": soln_dense_hyy,
+    }
+  
+  def smoother(self, x, scale):
+    ''' Returns one-sided smoothing u(x) of a step, such that
+      1. u(x < -scale) = 0
+      2. u(x >= 0) = 1.
+      3. u smoothly interpolates from 0 to 1 in between.
+    '''
+    # Shift, scale, and clip to [-1, 0] to prevent exp overflow
+    _x = np.clip(x / scale + 1, 0, 1)
+    f0 = np.exp(-1/np.where(_x == 0, 1, _x))
+    f1 = np.exp(-1/np.where(_x == 1, 1, 1-_x))
+    # Return piecewise evaluation
+    return np.where(_x >= 1, 1,
+            np.where(_x <= 0, 0, 
+              f0 / (f0 + f1)))
+
+  def frag_source(self, p, T, y, yF, L_f):
+    ''' Fragmentation source term appearing in ODE for y_f.
+      Here L_f is the lengthscale equal to u * tau_f. '''
+    yM = 1.0 - self.yA - y
+    if self.fragsmooth_scale == 0:
+      # Compute rate-limiting-type smoothing factor replacing (yM - yF)
+      # rate_factor = np.clip(yM - yF, 0, yF/yM+0.02)
+      rate_factor = yM - yF
+
+      return rate_factor / L_f \
+        * np.array(self.vf_g(p, T, y) >= self.crit_volfrac).astype(float)
+    else:
+      # Compute smoothing coordinate and smoothing function
+      t = self.vf_g(p, T, y) - self.crit_volfrac
+      shape = self.smoother(t, self.fragsmooth_scale)
+      return (yM - yF) / L_f * shape
 
   def solve_ssIVP(self, p_chamber, j0, dense_output=False) -> tuple:
     ''' Solves initial value problem for (p,h,y)(x), given fully specified
@@ -346,7 +575,7 @@ class SteadyState():
       # Compute source vector
       F[0] = F_rho(p, T, y, yF, rho) 
       F[2] = Y(p, y)
-      F[3] = (yM - yF) / self.tau_f * float(self.vf_g(p, T, y) >= self.crit_volfrac)
+      F[3] = self.frag_source(p, T, y, yF, self.tau_f) # hard-coded u = 1
       return F
     if self._DEBUG:  
       # Cache source term (cannot be pickled with default pickle module)
@@ -399,8 +628,7 @@ class SteadyState():
         + F_rho(p, T, y, yF, 1.0/v) \
           * np.vstack((a1, np.zeros((2, vec_length)))) \
         + np.vstack([np.zeros((3, vec_length)),
-          (yM - yF) / (u * self.tau_f)
-            * np.array(self.vf_g(p, T, y) >= self.crit_volfrac).astype(float)])
+          self.frag_source(p, T, y, yF, u * tau_f)])
       if not vectorized:
         # Return flattened version
         return out.squeeze(axis=-1)
