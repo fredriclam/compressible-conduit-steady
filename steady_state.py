@@ -51,7 +51,7 @@ class SteadyState():
 
   def __init__(self, x_global:np.array, p_vent:float, inlet_input_val:float,
     input_type:str="u", override_properties:dict=None,
-    use_static_cache:bool=False):
+    use_static_cache:bool=False, skip_rootfinding=False):
     ''' 
     Steady state ODE solver.
     Inputs:
@@ -113,7 +113,22 @@ class SteadyState():
     self.solubility_n   = self.override_properties.pop("solubility_n", 0.5)
     # Whether to neglect deformation energy in magma EOS
     self.neglect_edfm   = self.override_properties.pop("neglect_edfm", False)
-    self.fragsmooth_scale     = self.override_properties.pop("fragsmooth_scale", 0.01)
+    self.fragsmooth_scale = self.override_properties.pop("fragsmooth_scale", 0.01)
+    # Strain rate criterion
+    self.crit_strain_rate_k = self.override_properties.pop("crit_strain_rate_k", 0.01)
+    # self.crit_strain_rate = self.crit_strain_rate_k * self.K_magma / self.mu
+    # Fragmentation criterion selection
+    self.fragmentation_criterion = self.override_properties.pop("fragmentation_criterion", "VolumeFraction")
+
+    # Bind fragmentation source
+    if self.fragmentation_criterion.casefold() == "VolumeFraction".casefold():
+      self.frag_source = self.frag_source_volfrac
+    elif self.fragmentation_criterion.casefold() == "StrainRate".casefold():
+      self.frag_source = self.frag_source_strain_rate
+    else:
+      raise ValueError(f"Unknown fragmentation criterion with string " +
+                       f"{self.fragmentation_criterion}. Try " +
+                       f"VolumeFraction, or StrainRate.")
 
     # Debug option (caches AinvRHS, source term F as lambdas that cannot be
     # pickled by the default pickle module)
@@ -160,7 +175,9 @@ class SteadyState():
     propshash = hash(tuple(override_properties.items()))
     inputs_array = np.array([x_global.min(), x_global.max(), 
       p_vent, inlet_input_val])
-    if use_static_cache \
+    if skip_rootfinding:
+      pass
+    elif use_static_cache \
       and propshash == SteadyState.checkhash \
       and np.all(inputs_array == SteadyState.last_crit_inputs):
       self.j0, self.p_chamber = SteadyState.cached_j0_p
@@ -360,7 +377,7 @@ class SteadyState():
       o2 = F_rho(p, T, y, yF, 1.0/v) * np.vstack((a1, np.zeros((2, vec_length))))
       # Compute fragmentation source contribution with mode [0, 0, 0, 1]
       o3 = np.vstack([np.zeros((3, vec_length)),
-           self.frag_source(p, T, y, yF, u * self.tau_f)])
+           self.frag_source(p, T, y, yF, u * self.tau_f, j0)])
       out = o1 + o2 + o3
 
       # Transform independent coordinates from x to p
@@ -504,7 +521,7 @@ class SteadyState():
             np.where(_x <= 0, 0, 
               f0 / (f0 + f1)))
 
-  def frag_source(self, p, T, y, yF, L_f):
+  def frag_source_volfrac(self, p, T, y, yF, L_f, j0):
     ''' Fragmentation source term appearing in ODE for y_f.
       Here L_f is the lengthscale equal to u * tau_f. '''
     yM = 1.0 - self.yA - y
@@ -519,6 +536,64 @@ class SteadyState():
       # Compute smoothing coordinate and smoothing function
       t = self.vf_g(p, T, y) - self.crit_volfrac
       shape = self.smoother(t, self.fragsmooth_scale)
+      return (yM - yF) / L_f * shape
+  
+  def strain_rate(self, p, T, y, yF, j0):
+
+    def dpdxRHS(p, T, y, yF, vectorized=False):
+      ''' Supports vectorized input if vectorized=True. '''
+      v     = self.v_mix(p, T, y)
+      # Compute first column of A^{-1}:(2,1)
+      a1 = 1.0 / (1.0 + j0 * j0 * self.dv_dp(p, T, y) \
+                  + v * j0 * j0 * self.dv_dh(p, T, y))
+      # Compute z == -A^{-1} * b / u
+      z = -j0 * self.dv_dy(p, T, y) / v * a1
+
+      # Define equivalent source for mass fraction exsolved (y, or yWv)
+      target_yWd = lambda p: np.clip(
+        self.x_sat(p) * (1.0 - self.yC - self.yWt - self.yA), 0, self.yWt - self.yWvInletMin)
+      Y = lambda p, y: 1.0 / self.tau_d * ((self.yWt - y) - target_yWd(p))
+      # Define gravity momentum source
+      F_grav = lambda rho: rho * (-9.8)
+      # Define ODE momentum source term sum in terms of density rho
+      F_rho = lambda p, T, y, yF, rho: F_grav(rho) \
+        + self.F_fric(p, T, y, yF, rho, j0/rho)
+
+      out = Y(p,y) * z + F_rho(p, T, y, yF, 1.0 / v) * a1
+      if not vectorized:
+        # Return flattened version
+        return out.squeeze()
+      return out
+
+    # Compute strain rate
+    rho = 1.0 / self.v_mix(p, T, y)
+    dpdx = dpdxRHS(p, T, y, yF)    
+    return -self.rho0_magma * self.rho0_magma / (rho * rho * rho) \
+      * j0 / self.K_magma * dpdx
+
+  def frag_source_strain_rate(self, p, T, y, yF, L_f, j0):
+    ''' Fragmentation source term appearing in ODE for y_f, using
+    a strain-rate based criterion (Papale 99).
+      Here L_f is the lengthscale equal to u * tau_f. '''
+    yM = 1.0 - self.yA - y
+
+    gamma_dot = self.strain_rate(p, T, y, yF, j0)
+    crit_strain_rate = self.crit_strain_rate_k * self.K_magma \
+      / self.F_fric_viscosity_model(T, y, yF)
+
+    if self.fragsmooth_scale == 0:
+      # Compute rate-limiting-type smoothing factor replacing (yM - yF)
+      # rate_factor = np.clip(yM - yF, 0, yF/yM+0.02)
+      rate_factor = yM - yF
+      
+      
+
+      return rate_factor / L_f \
+        * np.array(gamma_dot >= crit_strain_rate).astype(float)
+    else:
+      # Compute smoothing coordinate and smoothing function
+      t = gamma_dot - crit_strain_rate
+      shape = self.smoother(t, self.fragsmooth_scale * crit_strain_rate)
       return (yM - yF) / L_f * shape
 
   def solve_ssIVP(self, p_chamber, j0, dense_output=False) -> tuple:
@@ -575,7 +650,7 @@ class SteadyState():
       # Compute source vector
       F[0] = F_rho(p, T, y, yF, rho) 
       F[2] = Y(p, y)
-      F[3] = self.frag_source(p, T, y, yF, self.tau_f) # hard-coded u = 1
+      F[3] = self.frag_source(p, T, y, yF, self.tau_f, j0) # hard-coded u = 1
       return F
     if self._DEBUG:  
       # Cache source term (cannot be pickled with default pickle module)
@@ -628,7 +703,7 @@ class SteadyState():
         + F_rho(p, T, y, yF, 1.0/v) \
           * np.vstack((a1, np.zeros((2, vec_length)))) \
         + np.vstack([np.zeros((3, vec_length)),
-          self.frag_source(p, T, y, yF, u * tau_f)])
+          self.frag_source(p, T, y, yF, u * tau_f, j0)])
       if not vectorized:
         # Return flattened version
         return out.squeeze(axis=-1)
@@ -1088,6 +1163,7 @@ class SteadyState():
       return x, (p_soln, h_soln, y_soln, yF_soln), calc_details
     else:
       return x, (p_soln, h_soln, y_soln, yF_soln)
+
 
 def parallel_forward_map(f:SteadyState, mg_p, mg_j0, num_processes=None):
   ''' Runs the forward ODE solution map in parallel.
