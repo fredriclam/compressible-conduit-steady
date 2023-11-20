@@ -1280,7 +1280,8 @@ class StaticPlug():
     return self.mixture.y_wv_eq(p, self.yWt, self.yC)
   
   def __call__(self, x:np.array, io_format:str="quail",
-               p_vent_atol=1e-3, p_vent_max_num_iterations:int=16) -> np.array:
+               p_vent_atol=1e-3, p_vent_max_num_iterations:int=16,
+               is_solve_direction_downward=False) -> np.array:
     '''Returns U sampled on x in quail format (default).
     Requires x to be points in interval [self.x_mesh.min(), self.x_mesh.max()].
     Inputs:
@@ -1290,6 +1291,8 @@ class StaticPlug():
       p_vent_atol: absolute tolerance in p_vent error for scaling traction if
         p_vent is provided through self.enforce_p_vent
       p_vent_max_num_iterations: max number of iterations to use for matching p_vent
+      is_solve_direction_downward (default: False): if True, ignore self.p_chamber,
+        and solve initial value problem from vent downward using self.enforce_p_vent
     ''' 
 
     # Check validity
@@ -1306,7 +1309,25 @@ class StaticPlug():
       raise ValueError("Requested values at x not in initial global mesh.")
 
     # Check for p_vent scale option
-    if self.enforce_p_vent is None or self.enforce_p_vent == 0:
+    if is_solve_direction_downward:
+      if self.enforce_p_vent is None or self.enforce_p_vent == 0:
+        raise ValueError("Did not find a nonzero value for p_vent. "
+                         +"Reinitialize this object with a positive value for enforce_p_vent. ")
+      # Define hydrostatic RHS
+      def hydrostatic_RHS(x, p):
+        yWt = self.yWt_fn(x)
+        yC = self.yC_fn(x)
+        T = self.T_fn(x)
+        yWv = self.mixture.y_wv_eq(p, yWt, yC)
+        return self.traction_fn(x) - 9.8 / self.v_mix(p, T, yWv)
+      soln = scipy.integrate.solve_ivp(hydrostatic_RHS,
+          (self.x_mesh[-1],self.x_mesh[0]), # This goes (x_top, x_bottom)
+          np.array([self.enforce_p_vent]),
+          # t_eval=self.x_mesh,
+          # method="Radau",
+          max_step=0.5, # Likely mesh size in Quail
+          dense_output=True,)
+    elif self.enforce_p_vent is None or self.enforce_p_vent == 0:
       # Define hydrostatic RHS
       def hydrostatic_RHS(x, p):
         yWt = self.yWt_fn(x)
@@ -1368,18 +1389,19 @@ class StaticPlug():
         if np.abs(p_vent_iterate - self.enforce_p_vent) < p_vent_atol:
           break
 
-    # Check bounds of soln
-    if soln.t[-1] < self.x_mesh[-1]:
-      print("Warning: IVP terminated below top of domain.")
     # Extract interpolator from scipy.integrate.solve_ivp
     dense_soln = soln.sol
     # Evaluate solution using interpolator
     Q = dense_soln(np.unique(x))
-    # Extrapolate out-of-bounds values using nearest value
-    last_legit_index = len(np.unique(x)) \
-      - np.argmax(np.unique(x)[::-1] <= soln.t.max()) - 1
-    Q[:, np.unique(x) > soln.t.max()] = \
-      Q[:, last_legit_index:last_legit_index+1]
+    # Check bounds of soln
+    if not is_solve_direction_downward:
+      if(soln.t[-1] < self.x_mesh[-1]):
+        print("Warning: IVP terminated below top of domain.")
+      # Extrapolate out-of-bounds values using nearest value
+      last_legit_index = len(np.unique(x)) \
+        - np.argmax(np.unique(x)[::-1] <= soln.t.max()) - 1
+      Q[:, np.unique(x) > soln.t.max()] = \
+        Q[:, last_legit_index:last_legit_index+1]
 
     # Compute solution in requested format
     if "p".casefold() == io_format.casefold() \
