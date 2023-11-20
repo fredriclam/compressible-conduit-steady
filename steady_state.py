@@ -889,7 +889,7 @@ class SteadyState():
       raise ValueError(f"Unknown output format string '{io_format}'.")
 
   def solve_steady_state_problem(self, p_vent:float, inlet_input_val:float,
-    input_type:str="u", verbose=False):
+    input_type:str="u", verbose=False, _internal_debug_flag=False):
     ''' Solves for the choking pressure and corresponding flow state.
     Input mass flux j0, velocity u, or chamber pressure p_chamber to compute
     the corresponding steady state. Specify input_type="j", "u", or "p" to access
@@ -978,6 +978,12 @@ class SteadyState():
       _t, _z, outs = solve_kernel(z)
       return -1e-1 if len(outs[0].t_events[0]) != 0 or not outs[0].success else \
         np.abs(outs[1][0])
+    
+    def guarded_p_top_diff(z):
+      ''' Returns pressure at top of domain, with guard for internal choking.''' 
+      _t, _z, outs = solve_kernel(z)
+      return -1e-1 if len(outs[0].t_events[0]) != 0 or not outs[0].success else \
+        _z[0,-1]
 
     ''' 
     For input p_chamber, the bounds on p_vent are given by the hydrostatic and
@@ -1018,7 +1024,11 @@ class SteadyState():
         x, (p_soln, h_soln, y_soln, yF_soln), soln = None, (None, None, None), None
       else:
         print("Subsonic flow at vent. Shooting method for correct value of z.")
-        z = scipy.optimize.brentq(lambda z: calc_vent_p(z) - p_vent, z_min, z_max, xtol=brent_atol)
+        if _internal_debug_flag:
+          return lambda z: calc_vent_p(z) - p_vent, z_min, z_max
+        # Set search range j0 in [0.0, z_min==z_choke==j0_choked]
+        # For mass flux below choking, flow should be subsonic in the interior
+        z = scipy.optimize.brentq(lambda z: calc_vent_p(z) - p_vent, 0.0, z_min, xtol=brent_atol)
         print("Solution j0 found. Computing solution.")
         # Compute solution at j0
         x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
