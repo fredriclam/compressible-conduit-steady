@@ -1123,7 +1123,7 @@ class SteadyState():
       raise ValueError(f"Unknown output format string '{io_format}'.")
 
   def solve_steady_state_problem(self, p_vent:float, inlet_input_val:float,
-    input_type:str="u", verbose=False):
+    input_type:str="u", verbose=False, _internal_debug_flag=False):
     ''' Solves for the choking pressure and corresponding flow state.
     Input mass flux j0, velocity u, or chamber pressure p_chamber to compute
     the corresponding steady state. Specify input_type="j", "u", or "p" to access
@@ -1212,6 +1212,12 @@ class SteadyState():
       _t, _z, outs = solve_kernel(z)
       return -1e-1 if len(outs[0].t_events[0]) != 0 or not outs[0].success else \
         np.abs(outs[1][0])
+    
+    def guarded_p_top_diff(z):
+      ''' Returns pressure at top of domain, with guard for internal choking.''' 
+      _t, _z, outs = solve_kernel(z)
+      return -1e-1 if len(outs[0].t_events[0]) != 0 or not outs[0].success else \
+        _z[0,-1]
 
     ''' 
     For input p_chamber, the bounds on p_vent are given by the hydrostatic and
@@ -1252,7 +1258,11 @@ class SteadyState():
         x, (p_soln, h_soln, y_soln, yF_soln), soln = None, (None, None, None), None
       else:
         print("Subsonic flow at vent. Shooting method for correct value of z.")
-        z = scipy.optimize.brentq(lambda z: calc_vent_p(z) - p_vent, z_min, z_max, xtol=brent_atol)
+        if _internal_debug_flag:
+          return lambda z: calc_vent_p(z) - p_vent, z_min, z_max
+        # Set search range j0 in [0.0, z_min==z_choke==j0_choked]
+        # For mass flux below choking, flow should be subsonic in the interior
+        z = scipy.optimize.brentq(lambda z: calc_vent_p(z) - p_vent, 0.0, z_min, xtol=brent_atol)
         print("Solution j0 found. Computing solution.")
         # Compute solution at j0
         x, (p_soln, h_soln, y_soln, yF_soln), (soln, _) = solve_kernel(z)
@@ -1398,6 +1408,285 @@ class SteadyState():
     else:
       return x, (p_soln, h_soln, y_soln, yF_soln)
 
+
+class StaticPlug():
+
+  def __init__(self, x_global:np.array, p_chamber:float, 
+               traction_fn:callable, yWt_fn:callable, yC_fn:callable, T_fn:callable,
+               override_properties:dict=None, enforce_p_vent=None):
+    ''' 
+    Hydrostatic ODE solver with plug.
+    Inputs:
+      x_global: global x coordinates (necessary to coordinate solution between
+        several 1D patches)
+      p_chamber: chamber pressure
+
+            override_properties (dict): map from property name to value. See first
+        section of __init__ for overridable properties.
+    Call this object to sample the solution at a grid x, consistent with the
+    provided value of conduit_length.
+    '''
+    # Update function-valued properties
+    self.traction_fn = traction_fn
+    self.yWt_fn = yWt_fn
+    self.yC_fn = yC_fn
+    self.T_fn = T_fn
+    self.p_chamber = p_chamber
+    # Validate properties
+    if override_properties is None:
+      override_properties = {}
+    self.override_properties = override_properties.copy()
+    ''' Set default and overridable properties'''
+    self.yA             = self.override_properties.pop("yA", 1e-7) # yA > 0 for positivity preserving limiter
+    self.c_v_magma      = self.override_properties.pop("c_v_magma", 3e3)
+    self.rho0_magma     = self.override_properties.pop("rho0_magma", 2.7e3)
+    self.K_magma        = self.override_properties.pop("K_magma", 10e9)
+    self.p0_magma       = self.override_properties.pop("p0_magma", 5e6)
+    self.solubility_k   = self.override_properties.pop("solubility_k", 5e-6)
+    self.solubility_n   = self.override_properties.pop("solubility_n", 0.5)
+    # Whether to neglect deformation energy in magma EOS
+    self.neglect_edfm   = self.override_properties.pop("neglect_edfm", False)
+    self.fragmentation_criterion = self.override_properties.pop("fragmentation_criterion", "VolumeFraction")
+
+    # Save option / value for enforcing vent pressure
+    self.enforce_p_vent = enforce_p_vent
+
+    # Bind fragmentation source
+    if self.fragmentation_criterion.casefold() == "VolumeFraction".casefold():
+      pass # Removed. See class SteadyState
+      # self.frag_source = self.frag_source_volfrac
+    elif self.fragmentation_criterion.casefold() == "StrainRate".casefold():
+      pass  # Removed. See class SteadyState
+      # self.frag_source = self.frag_source_strain_rate
+    else:
+      raise ValueError(f"Unknown fragmentation criterion with string " +
+                       f"{self.fragmentation_criterion}. Try " +
+                       f"VolumeFraction, or StrainRate.")
+
+    # Output mesh
+    self.x_mesh = x_global.copy()
+    # Internal computation mesh
+    self.x_mesh_native = x_global.copy()
+    self.conduit_length = x_global.max() - x_global.min()
+
+    # Input validation
+    if len(self.override_properties.items()) > 0:
+      raise ValueError(
+        f"Unused override properties:{list(self.override_properties.keys())}")
+
+    # Set depth of conduit inlet
+    self.x0 = x_global.min()
+
+    # Set mixture properties
+    mixture = matprops.MixtureMeltCrystalWaterAir()
+    mixture.magma = matprops.MagmaLinearizedDensity(c_v=self.c_v_magma,
+      rho0=self.rho0_magma, K=self.K_magma,
+      p_ref=self.p0_magma, neglect_edfm=self.neglect_edfm)
+    mixture.k, mixture.n = self.solubility_k, self.solubility_n
+    self.mixture = mixture
+
+    self._has_lambda = True
+
+  ''' Define partially evaluated thermo functions in terms of (p, h, y)'''
+
+  def T_ph(self, p, h, y):
+    return self.mixture.T_ph(p, h, self.yA, y, 1.0-y-self.yA)
+
+  def v_mix(self, p, T, y):
+    return self.mixture.v_mix(p, T, self.yA, y, 1.0-y-self.yA)
+
+  def dv_dp(self, p, T, y):
+    return self.mixture.dv_dp(p, T, self.yA, y, 1.0-y-self.yA)
+
+  def dv_dh(self, p, T, y):
+    return self.mixture.dv_dh(p, T, self.yA, y, 1.0-y-self.yA)
+
+  def dv_dy(self, p, T, y):
+    return self.mixture.dv_dy(p, T, self.yA, y, 1.0-y-self.yA)
+
+  def vf_g (self, p, T, y):
+    return self.mixture.vf_g(p, T, self.yA, y, 1.0-y-self.yA)
+
+  def x_sat(self, p):
+    return self.mixture.x_sat(p)
+
+  def y_wv_eq(self, p):
+    return self.mixture.y_wv_eq(p, self.yWt, self.yC)
+  
+  def __call__(self, x:np.array, io_format:str="quail",
+               p_vent_atol=1e-3, p_vent_max_num_iterations:int=16,
+               is_solve_direction_downward=False) -> np.array:
+    '''Returns U sampled on x in quail format (default).
+    Requires x to be points in interval [self.x_mesh.min(), self.x_mesh.max()].
+    Inputs:
+      x: array of points. If io_format=="quail", x is expected to have
+        three-dimensional shape (ne, n).
+      io_format: either "quail" or "p". The latter is only pressure.
+      p_vent_atol: absolute tolerance in p_vent error for scaling traction if
+        p_vent is provided through self.enforce_p_vent
+      p_vent_max_num_iterations: max number of iterations to use for matching p_vent
+      is_solve_direction_downward (default: False): if True, ignore self.p_chamber,
+        and solve initial value problem from vent downward using self.enforce_p_vent
+    ''' 
+
+    # Check validity
+    if not self._has_lambda:
+      raise ValueError("This function has been called already, and the callables"
+                       + " traction_fn, yWt_fn, yC_fn, T_fn have been deleted for"
+                       + " pickling in quail. To disable this behaviour, see"
+                       + " in module steady_state StaticPlug.__call__.")
+
+
+    # Check that input x is consistent with internal length
+    if x.max() > self.x_mesh.max() \
+      or x.min() < self.x_mesh.min():
+      raise ValueError("Requested values at x not in initial global mesh.")
+
+    # Check for p_vent scale option
+    if is_solve_direction_downward:
+      if self.enforce_p_vent is None or self.enforce_p_vent == 0:
+        raise ValueError("Did not find a nonzero value for p_vent. "
+                         +"Reinitialize this object with a positive value for enforce_p_vent. ")
+      # Define hydrostatic RHS
+      def hydrostatic_RHS(x, p):
+        yWt = self.yWt_fn(x)
+        yC = self.yC_fn(x)
+        T = self.T_fn(x)
+        yWv = self.mixture.y_wv_eq(p, yWt, yC)
+        return self.traction_fn(x) - 9.8 / self.v_mix(p, T, yWv)
+      soln = scipy.integrate.solve_ivp(hydrostatic_RHS,
+          (self.x_mesh[-1],self.x_mesh[0]), # This goes (x_top, x_bottom)
+          np.array([self.enforce_p_vent]),
+          # t_eval=self.x_mesh,
+          # method="Radau",
+          max_step=0.5, # Likely mesh size in Quail
+          dense_output=True,)
+    elif self.enforce_p_vent is None or self.enforce_p_vent == 0:
+      # Define hydrostatic RHS
+      def hydrostatic_RHS(x, p):
+        yWt = self.yWt_fn(x)
+        yC = self.yC_fn(x)
+        T = self.T_fn(x)
+        yWv = self.mixture.y_wv_eq(p, yWt, yC)
+        return self.traction_fn(x) - 9.8 / self.v_mix(p, T, yWv)
+      soln = scipy.integrate.solve_ivp(hydrostatic_RHS,
+          (self.x_mesh[0],self.x_mesh[-1]),
+          np.array([self.p_chamber]),
+          # t_eval=self.x_mesh,
+          # method="Radau",
+          max_step=0.5, # Likely mesh size in Quail
+          dense_output=True,)
+    else:
+      # Define hydrostatic RHS
+      def tractionfree_hydrostatic_RHS(x, p):
+        yWt = self.yWt_fn(x)
+        yC = self.yC_fn(x)
+        T = self.T_fn(x)
+        yWv = self.mixture.y_wv_eq(p, yWt, yC)
+        return - 9.8 / self.v_mix(p, T, yWv)
+      soln_tractionfree = scipy.integrate.solve_ivp(tractionfree_hydrostatic_RHS,
+          (self.x_mesh[0],self.x_mesh[-1]),
+          np.array([self.p_chamber]),
+          # t_eval=self.x_mesh,
+          # method="Radau",
+          max_step=0.5, # Likely mesh size in Quail
+          dense_output=True,)
+      # Extract initial p_vent
+      p_vent_iterate = soln_tractionfree.y[0,-1]
+      # Integrate traction_fn using trapezoidal method
+      delta_p = -scipy.integrate.trapezoid(self.traction_fn(np.unique(x)), np.unique(x))
+      if delta_p < 0:
+        raise ValueError(f"Positive traction, indicating upward drag on static fluid in conduit.")
+      scale_value = (p_vent_iterate - self.enforce_p_vent) / delta_p
+      if scale_value < 0:
+        raise ValueError(f"Pressure without traction ({p_vent_iterate}) is below specified p_vent ({self.enforce_p_vent}).")
+
+      # Iterative procedure for scaling traction function to match vent pressure
+      # If convex in the right way, the sequence of iterates are monotone
+      for i in range(p_vent_max_num_iterations):
+        def hydrostatic_RHS(x, p):
+          yWt = self.yWt_fn(x)
+          yC = self.yC_fn(x)
+          T = self.T_fn(x)
+          yWv = self.mixture.y_wv_eq(p, yWt, yC)
+          return scale_value * self.traction_fn(x) - 9.8 / self.v_mix(p, T, yWv)
+        soln = scipy.integrate.solve_ivp(hydrostatic_RHS,
+            (self.x_mesh[0],self.x_mesh[-1]),
+            np.array([self.p_chamber]),
+            # t_eval=self.x_mesh,
+            # method="Radau",
+            max_step=0.5, # Likely mesh size in Quail
+            dense_output=True,)
+        p_vent_iterate = soln.y[0,-1]
+        print(p_vent_iterate)
+        scale_value += (p_vent_iterate - self.enforce_p_vent) / delta_p
+        if np.abs(p_vent_iterate - self.enforce_p_vent) < p_vent_atol:
+          break
+
+    # Extract interpolator from scipy.integrate.solve_ivp
+    dense_soln = soln.sol
+    # Evaluate solution using interpolator
+    Q = dense_soln(np.unique(x))
+    # Check bounds of soln
+    if not is_solve_direction_downward:
+      if(soln.t[-1] < self.x_mesh[-1]):
+        print("Warning: IVP terminated below top of domain.")
+      # Extrapolate out-of-bounds values using nearest value
+      last_legit_index = len(np.unique(x)) \
+        - np.argmax(np.unique(x)[::-1] <= soln.t.max()) - 1
+      Q[:, np.unique(x) > soln.t.max()] = \
+        Q[:, last_legit_index:last_legit_index+1]
+
+    # Compute solution in requested format
+    if "p".casefold() == io_format.casefold() \
+       or "native".casefold() == io_format.casefold():
+      # Return solution state (p)
+       # Evaluate solution using interpolator
+      _output = Q
+    elif "quail".casefold() == io_format.casefold():
+      p = Q
+      # Evaluate specified mass fractions, temperature
+      yC = self.yC_fn(np.unique(x))
+      yWt = self.yWt_fn(np.unique(x))
+      yWv = self.mixture.y_wv_eq(p, yWt, yC)
+      T = self.T_fn(np.unique(x))
+      # Compute mixture intermediates
+      v = self.v_mix(p, T, yWv)
+      rho = 1.0 / v
+      
+      # Load and return conservative state vector
+      U = np.zeros((*np.unique(x).shape,8))
+      U[...,0] = self.yA * rho
+      U[...,1] = yWv * rho
+      U[...,2] = (1.0 - (yWv + self.yA)) * rho
+      U[...,3] = 0.0
+      U[...,4] = (U[...,0] * self.mixture.air.c_v
+                  + U[...,1] * self.mixture.waterEx.c_v
+                  + U[...,2] * self.c_v_magma
+                 ) * T
+      U[...,5] = yWt * rho
+      U[...,6] = yC * rho
+      U[...,7] = 0.0 # TODO: Compute fragmentation?
+
+      ''' Extract only values of U that correspond to query locations x. '''
+      # Define associative map from value of x to state vector U
+      vals = {x: U[i,:] for i, x in enumerate(np.unique(x))}
+      U_out = np.zeros((*x.shape[:2],8))
+      # Map sample locations to state values U (possibly duplicated x)
+      for i in range(U_out.shape[0]):
+        for j in range(U_out.shape[1]):
+          U_out[i,j,:] = vals[x[i,j,0]]
+      _output = U_out
+    else:
+      raise ValueError(f"Unknown output format string '{io_format}'.")
+    
+    # Clean up and return output
+    self.traction_fn = None
+    self.yWt_fn = None
+    self.yC_fn = None
+    self.T_fn = None
+    self._has_lambda = False
+    return _output
 
 def parallel_forward_map(f:SteadyState, mg_p, mg_j0, num_processes=None):
   ''' Runs the forward ODE solution map in parallel.
