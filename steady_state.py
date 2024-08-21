@@ -215,8 +215,10 @@ class SteadyState():
   def x_sat(self, p):
     return self.mixture.x_sat(p)
 
-  def y_wv_eq(self, p):
-    return self.mixture.y_wv_eq(p, self.yWt, self.yC)
+  def y_wv_eq(self, p, yWt=None):
+    if yWt is None:
+      yWt = self.yWt
+    return self.mixture.y_wv_eq(p, yWt, self.yC)
 
   def A(self, p, h, y, yf, j0):
     ''' Return coefficient matrix to ODE (A in A dq/dx = f(q)).
@@ -262,28 +264,46 @@ class SteadyState():
     l2 = 0.5*(_q1 + _q2)
     return np.array([l1, l2, u, u])
   
-  def F_fric(self, p, T, y, yF, rho, u) -> float:
-    ''' Friction (force per unit volume)'''
+  def F_fric(self, p, T, y, yF, rho, u, yWt=None, yC=None) -> float:
+    ''' Friction (force per unit volume)
+    
+    Backwards compatible for constant yWt (set yWt to None) or vector
+    valued yWt of same size of y.
+    Backwards compatible for constant yC (set yC to None) or vector
+    valued yC of same size of y.
+    '''
 
     # Poll friction model
     # mu = self.mu
-    mu = self.F_fric_viscosity_model(T, y, yF)
+    mu = self.F_fric_viscosity_model(T, y, yF, yWt=yWt, yC=yC)
 
     # Compute fractional indicator using yF / yM (liquid phase, not liquid melt)
     yM = 1.0 - self.yA - y
     # Continuous alternative to float(self.vf_g(p, T, y) > self.crit_volfrac)
 
     frag_factor = np.clip(1.0 - yF/yM, 0.0, 1.0)
-    return -8.0*mu/self.conduit_radius**2 * u * frag_factor
+    return -8.0*mu/(self.conduit_radius*self.conduit_radius) * u * frag_factor
 
-  def F_fric_viscosity_model(self, T, y, yF):
+  def F_fric_viscosity_model(self, T, y, yF, yWt=None, yC=None):
     ''' Calculates the viscosity as a function of dissolved
     water and crystal content (assumes crystal phase is incompressible)/
     Does not take into account fragmented vs. not fragmented (avoiding
     double-dipping the effect of fragmentation).
+
+    Backwards compatible for constant yWt (set yWt to None) or vector
+    valued yWt of same size of y.
+    Backwards compatible for constant yC (set yC to None) or vector
+    valued yC of same size of y.
     '''
+
+    # Constant crystal content
+    if yWt is None:
+      yWt = self.yWt
+    if yC is None:
+      yC = self.yC
+
     # Calculate pure melt viscosity (Hess & Dingwell 1996)
-    yWd = self.yWt - y
+    yWd = yWt - y
     yL = self.yL
     yM = 1.0 - y - self.yA
     mfWd = yWd / yL # mass concentration of dissolved water
@@ -302,7 +322,7 @@ class SteadyState():
     B = 2.5
     # Compute volume fraction of crystal at equal phasic densities
     # Using crystal volume per (melt + crystal + dissolved water) volume
-    phi_ratio = np.clip((self.yC / yM) / phi_cr, 0.0, None)
+    phi_ratio = np.clip((yC / yM) / phi_cr, 0.0, None)
     erf_term = erf(
       np.sqrt(np.pi) / (2 * alpha) * phi_ratio * (1 + phi_ratio**gamma))
     crysVisc = (1 + phi_ratio**delta) * ((1 - alpha * erf_term)**(-B * phi_cr))
@@ -504,7 +524,9 @@ class SteadyState():
       "range(p)": (soln_hyy.t.min(), soln_hyy.t.max()),
       "x(p)": soln_x.sol,
       "hyy(p)": soln_dense_hyy,
+      "soln_x": soln_x,
     }
+
   
   def smoother(self, x, scale):
     ''' Returns one-sided smoothing u(x) of a step, such that
@@ -816,7 +838,219 @@ class SteadyState():
     eigvals_t_final = self.eigA(*soln_state[:,-1], j0)
 
     return soln.t, soln_state, (soln, eigvals_t_final)
-  
+
+
+  def solve_ssIVP_yC_profile(self, p_chamber, j0, yC_fn:callable,
+                             yWt_fn:callable, dense_output=False) -> tuple:
+    ''' Solves initial value problem for (p,h,y)(x), given fully specified
+    chamber (boundary) state and a profile for yC and yWt. The args
+    yC and yWt are functions that return crystal and total water mass fractions
+    as a functon of space.
+    Returns a tuple with elements:
+      t: array
+      state: array (p, h, y) (array sized 3 x ...)
+      tup: informational tuple with solve_ivp return value `soln`,
+        and system eigvals at vent) '''
+
+    # Pull parameter values
+    yA, crit_volfrac, mu, tau_d, tau_f, conduit_radius, T_chamber = \
+      self.yA, self.crit_volfrac, self.mu, self.tau_d, \
+      self.tau_f, self.conduit_radius, self.T_chamber
+    yFInlet = self.yFInlet
+    # Compute auxiliary inlet conditions
+    yWtInlet = yWt_fn(self.x_mesh[0])
+    yWvInlet = np.clip(self.y_wv_eq(p_chamber, yWtInlet), self.yWvInletMin, None)
+    h_chamber = self.mixture.h_mix(
+      p_chamber, T_chamber, yA, yWvInlet, 1.0 - yA - yWvInlet)
+
+    ''' Define momentum source (using captured parameters). '''
+    # Define gravity momentum source
+    F_grav = lambda rho: rho * (-9.8)
+    # Define ODE momentum source term sum in terms of density rho
+    F_rho = lambda p, T, y, yF, rho, yWt, yC: F_grav(rho) \
+      + self.F_fric(p, T, y, yF, rho, j0/rho, yWt, yC)
+
+    ''' Define water vapour mass fraction source. '''
+    target_yWd = lambda p, yWt, yC: np.clip(
+      self.x_sat(p) * (1.0 - yC - yWt - yA),
+      0, yWt - self.yWvInletMin)
+    Y = lambda p, y, yWt, yC: 1.0 / tau_d * ((yWt - y) - target_yWd(p, yWt, yC))
+    
+    ''' Check debug state for caching RHS vector. '''
+    if self._DEBUG:  
+      def F(q):
+        # Unpack q of size (4,1)
+        p, h, y, yF = q
+        F = np.zeros((4,1))
+        # Compute mixture temperature, density
+        T = self.T_ph(p, h, y)
+        rho = 1.0/self.v_mix(p, T, y)
+        # Compute (constant) liquid melt fraction
+        yL = 1.0 - self.yWt - self.yC - self.yA
+        yM = 1.0 - self.yA - y
+        # Compute source vector
+        F[0] = F_rho(p, T, y, yF, rho) 
+        F[2] = Y(p, y)
+        F[3] = self.frag_source(p, T, y, yF, self.tau_f, j0) # hard-coded u = 1
+        return F
+      # Cache source term (cannot be pickled with default pickle module)
+      self.F = F
+
+    def AinvRHS(x, q, vectorized=False):
+      ''' Precomputed A^{-1} f for speed.
+      Uses block triangular inverse of
+        [A b]^{-1}  = [A^{-1}  z ]
+        [  u]         [       1/u]
+      applied to sparse RHS vector F.
+      Use this instead of RHS for speed. Supports vectorized input if
+        vectorized=True
+      '''
+      # Unpack
+      p, h, y, yF = q
+      # Evaluate spatially dependent yWt, yC
+      yWt, yC = yWt_fn(x), yC_fn(x)
+      # Compute dependents
+      T     = self.T_ph(p, h, y)
+      # dv_dp = y * (R / p * dT_dp(p, h, y) - R * T / p**2) + (1 - y) * dvm_dp(p)
+      # dv_dh = y * R / p * dT_dh(p, h, y)
+      # dv_dy = (v_wv(p, T) - v_m(p)) + y * R / p * dT_dy(p, T, y)
+      v     = self.v_mix(p, T, y) 
+      u     = j0 * v
+      # Compute first column of A^{-1}:(2,1)
+      a1 = np.vstack((np.ones_like(v), v)) / (1.0 + j0*j0*self.dv_dp(p, T, y) \
+        + v * j0*j0*self.dv_dh(p, T, y))
+      # Compute z == -A^{-1} * b / u
+      z = -j0*j0 * self.dv_dy(p, T, y) / u * a1
+      # yL = 1.0 - yWt - yC - yA
+      yM = 1.0 - y - yA
+
+      vec_length = p.shape[-1] if len(p.shape) > 0 else 1
+      # return Y(p, y) * np.array([*z, 1/u, 0]) \
+      #   + F_rho(p, T, y, yF, 1.0/v) * np.array([*a1, 0, 0]) \
+      #   + np.array([0, 0, 0, (yM - yF) / (u * self.tau_f)
+      #     * float(self.vf_g(p, T, y) >= self.crit_volfrac)])
+      out = Y(p, y, yWt, yC) * np.vstack((z,  1.0/u, np.zeros_like(u))) \
+        + F_rho(p, T, y, yF, 1.0/v, yWt, yC) \
+          * np.vstack((a1, np.zeros((2, vec_length)))) \
+        + np.vstack([np.zeros((3, vec_length)),
+          self.frag_source(p, T, y, yF, u * tau_f, j0)])
+      if not vectorized:
+        # Return flattened version
+        return out.squeeze(axis=-1)
+      return out
+    
+    def RHS_reduced(x, q):
+      ''' Reduced-size system for j0 == 0 case. (2x1 instead of 4x1).
+      Length scale of exsolution and fragmentation -> 0. '''
+      raise NotImplementedError("Not updated reduced model.")
+      p, h = q
+      F = np.zeros((2,1))
+      # Equilibrium water vapour
+      y = self.y_wv_eq(p)
+      # Compute mixture temperature
+      T = self.T_ph(p, h, y)
+      v = self.v_mix(p, T, y)
+      # Compute fragmented mass fraction
+      yM = 1.0 - y - yA
+      yF = yM if self.vf_g(p, T, y) >= self.crit_volfrac else 0
+      # Compute source vector with idempotent A^{-1} = A premultiplied
+      F[0] = 1
+      F[1] = v
+      F *= F_rho(p, T, y, yF, 1.0/self.v_mix(p, T, y)) 
+      return F.flatten()
+    
+    ''' Define postprocessing eigenvalue checker '''  
+    # Set captured lambdas
+    T_ph, dv_dp, v_mix, dv_dh = self.T_ph, self.dv_dp, self.v_mix, self.dv_dh
+    class EventChoked():
+      def __init__(self, y_wv_eq=None):
+        self.terminal = True
+        self.sonic_tol = 1e-7
+        # Capture function p -> y_wv if provided
+        self.y_wv_eq = y_wv_eq
+      def __call__(self, t, q):
+        # Compute equivalent condition to conjugate pair eigenvalue == 0
+        # Note that this does not check the condition u == 0 (or j0 == 0).
+        if len(q) > 2:
+          p, h, y, yF = q
+        else:
+          p, h = q
+          y = self.y_wv_eq(p)
+        T = T_ph(p, h, y)
+        # dv_dp = y * (R / p * dT_dp(p, h, y) - R * T / p**2) + (1 - y) * dvm_dp(p)
+        # dv_dh = y * R / p * dT_dh(p, h, y)
+        return j0**2 * (dv_dp(p, T, y) 
+          + v_mix(p, T, y) * dv_dh(p, T, y)) \
+          + 1.0 - self.sonic_tol
+        # Default numerical eigenvalue computation
+        return np.abs(np.linalg.eigvals(A(*q, j0))).min() - self.sonic_tol
+    
+    class ZeroPressure():
+      def __init__(self):
+        self.terminal = True
+        self.direction = -1.0
+      def __call__(self, t, q):
+        return q[0] # p
+
+    class ZeroEnthalpy():
+      def __init__(self):
+        self.terminal = True
+        self.direction = -1.0
+      def __call__(self, t, q):
+        return q[1] # h
+    
+    class PositivePressureGradient():
+      def __init__(self, RHS):
+        self.terminal = True
+        self.RHS = RHS
+      def __call__(self, t, q):
+        # Right hand side of dp/dx; is zero when dp/dx>0
+        return float(self.RHS(t, q)[0] <= 0)
+
+    # Set chamber (inlet) condition (p, h, y) with y = y_eq at pressure
+    q0 = np.array([p_chamber, h_chamber, yWvInlet, yFInlet])
+
+    if self._DEBUG:
+      # Cache ODE details
+      self.ivp_inputs = (AinvRHS, (self.x_mesh[0],self.x_mesh[-1]), q0, self.x_mesh, "Radau",
+        [EventChoked(), ZeroPressure(), ZeroEnthalpy(), PositivePressureGradient(AinvRHS)])
+    # Call ODE solver
+    if j0 > 0:
+      soln = scipy.integrate.solve_ivp(AinvRHS,
+        (self.x_mesh[0],self.x_mesh[-1]),
+        q0,
+        # t_eval=self.x_mesh,
+        method="Radau", dense_output=dense_output, max_step=10.0, # changed from 5.0
+        events=[EventChoked(), ZeroPressure(),
+          ZeroEnthalpy(), PositivePressureGradient(AinvRHS)])
+      # Output solution
+      soln_state = soln.y
+    else: # Exsolution length scale u * tau_d -> 0
+      # Exact zero flux: use reduced (equilibrium chemistry) system
+      soln = scipy.integrate.solve_ivp(RHS_reduced,
+        (self.x_mesh[0],self.x_mesh[-1]),
+        q0[0:2],
+        t_eval=self.x_mesh,
+        method="Radau", dense_output=dense_output, max_step=5.0,
+        events=[EventChoked(y_wv_eq=self.y_wv_eq), ZeroPressure(),
+          ZeroEnthalpy(), PositivePressureGradient(RHS_reduced)])
+      # Augment output solution with y at equilibrium and yF based on fragmentation criterion
+      p = soln.y[0,:]
+      yC = yC_fn(soln.x)
+      yWt = yWt_fn(soln.x)
+      yWv = self.y_wv_eq(p)
+      yM = 1.0 - yWv - self.yA
+      T = self.T_ph(p, soln.y[1,:], yWv)
+      yF = yM.copy()
+      yF = np.where(self.vf_g(p, T, yWv) >= self.crit_volfrac, yM, 0.0)
+      soln_state = np.vstack((soln.y, yWv, yF))
+
+    # Compute eigenvalues at the final t
+    eigvals_t_final = self.eigA(*soln_state[:,-1], j0)
+
+    return soln.t, soln_state, (soln, eigvals_t_final)
+
+
   def _set_cache(self, p_vent:float, inlet_input_val:float,
     input_type:str="u"):
     _, _, calc_details = self.solve_steady_state_problem(
