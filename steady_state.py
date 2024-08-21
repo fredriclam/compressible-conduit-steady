@@ -1413,23 +1413,35 @@ class StaticPlug():
 
   def __init__(self, x_global:np.array, p_chamber:float, 
                traction_fn:callable, yWt_fn:callable, yC_fn:callable, T_fn:callable,
+               yF_fn:callable=None,
                override_properties:dict=None, enforce_p_vent=None):
     ''' 
     Hydrostatic ODE solver with plug.
     Inputs:
       x_global: global x coordinates (necessary to coordinate solution between
         several 1D patches)
-      p_chamber: chamber pressure
+      p_chamber:        chamber pressure (Pa)
+      traction_fn:      function prescribing initial traction
+      yWt_fn:           function prescribing yWt(x)
+      yC_fn:            function prescribing yC(x)
+      T_fn:             function prescribing T(x)
+      yF_fn (optional): function prescribing yF(x)
+      override_properties (dict): map from property name to value. See first
+        section of StaticPlug.__init__ for overridable properties.
 
-            override_properties (dict): map from property name to value. See first
-        section of __init__ for overridable properties.
     Call this object to sample the solution at a grid x, consistent with the
     provided value of conduit_length.
     '''
+
     # Update function-valued properties
     self.traction_fn = traction_fn
     self.yWt_fn = yWt_fn
     self.yC_fn = yC_fn
+    if yF_fn is None:
+      # Default yF_fn is uniform 0
+      self.yF_fn = lambda x: np.zeros_like(x)
+    else:
+      self.yF_fn = yF_fn
     self.T_fn = T_fn
     self.p_chamber = p_chamber
     # Validate properties
@@ -1532,7 +1544,7 @@ class StaticPlug():
     # Check validity
     if not self._has_lambda:
       raise ValueError("This function has been called already, and the callables"
-                       + " traction_fn, yWt_fn, yC_fn, T_fn have been deleted for"
+                       + " traction_fn, yWt_fn, yC_fn, yF_fn, T_fn have been deleted for"
                        + " pickling in quail. To disable this behaviour, see"
                        + " in module steady_state StaticPlug.__call__.")
 
@@ -1647,6 +1659,7 @@ class StaticPlug():
       p = Q
       # Evaluate specified mass fractions, temperature
       yC = self.yC_fn(np.unique(x))
+      yF = self.yF_fn(np.unique(x))
       yWt = self.yWt_fn(np.unique(x))
       yWv = self.mixture.y_wv_eq(p, yWt, yC)
       T = self.T_fn(np.unique(x))
@@ -1666,7 +1679,7 @@ class StaticPlug():
                  ) * T
       U[...,5] = yWt * rho
       U[...,6] = yC * rho
-      U[...,7] = 0.0 # TODO: Compute fragmentation?
+      U[...,7] = yF * rho
 
       ''' Extract only values of U that correspond to query locations x. '''
       # Define associative map from value of x to state vector U
@@ -1684,6 +1697,7 @@ class StaticPlug():
     self.traction_fn = None
     self.yWt_fn = None
     self.yC_fn = None
+    self.yF_fn = None
     self.T_fn = None
     self._has_lambda = False
     return _output
