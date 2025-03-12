@@ -1414,7 +1414,7 @@ class StaticPlug():
   def __init__(self, x_global:np.array, p_chamber:float, 
                traction_fn:callable, yWt_fn:callable, yC_fn:callable, T_fn:callable,
                yF_fn:callable=None,
-               override_properties:dict=None, enforce_p_vent=None):
+               override_properties:dict=None, enforce_p_vent=None, num_state_variables=8):
     ''' 
     Hydrostatic ODE solver with plug.
     Inputs:
@@ -1428,6 +1428,7 @@ class StaticPlug():
       yF_fn (optional): function prescribing yF(x)
       override_properties (dict): map from property name to value. See first
         section of StaticPlug.__init__ for overridable properties.
+      num_state_variables: number of state variables in the system. Default is 8.
 
     Call this object to sample the solution at a grid x, consistent with the
     provided value of conduit_length.
@@ -1437,6 +1438,7 @@ class StaticPlug():
     self.traction_fn = traction_fn
     self.yWt_fn = yWt_fn
     self.yC_fn = yC_fn
+    self.num_state_variables = num_state_variables
     if yF_fn is None:
       # Default yF_fn is uniform 0
       self.yF_fn = lambda x: np.zeros_like(x)
@@ -1668,7 +1670,7 @@ class StaticPlug():
       rho = 1.0 / v
       
       # Load and return conservative state vector
-      U = np.zeros((*np.unique(x).shape,8))
+      U = np.zeros((*np.unique(x).shape, self.num_state_variables))
       U[...,0] = self.yA * rho
       U[...,1] = yWv * rho
       U[...,2] = (1.0 - (yWv + self.yA)) * rho
@@ -1684,7 +1686,7 @@ class StaticPlug():
       ''' Extract only values of U that correspond to query locations x. '''
       # Define associative map from value of x to state vector U
       vals = {x: U[i,:] for i, x in enumerate(np.unique(x))}
-      U_out = np.zeros((*x.shape[:2],8))
+      U_out = np.zeros((*x.shape[:2], self.num_state_variables))
       # Map sample locations to state values U (possibly duplicated x)
       for i in range(U_out.shape[0]):
         for j in range(U_out.shape[1]):
